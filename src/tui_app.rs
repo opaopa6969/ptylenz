@@ -11,10 +11,15 @@
 ///! The main loop multiplexes the PTY master fd and stdin via `polling`
 ///! so we never spin-wait on either source.
 ///!
-///! Key bindings (Normal mode):
-///!   Ctrl+B   open block-nav overlay
-///!   Ctrl+F   open search overlay
-///!   Ctrl+E   export blocks to JSON (current dir)
+///! Key bindings (Normal mode, tmux-style prefix):
+///!   Ctrl+]    prefix. After it, within 500ms:
+///!     b       open block-nav overlay
+///!     /       open search overlay
+///!     e       export blocks to JSON (current dir)
+///!     y       copy most recent block to clipboard
+///!     ]       send a literal Ctrl+] through to the child
+///!   If no follow-up key arrives in time, the Ctrl+] itself is
+///!   delivered to the child so readline bindings etc. still work.
 ///!
 ///! Key bindings (overlay):
 ///!   q / Esc  close overlay (or: in detail view, go back to list)
@@ -41,7 +46,13 @@ use ratatui::{
 use std::io::{self, Write};
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Prefix key (Ctrl+]) — initiates a tmux-style command sequence.
+const PREFIX_KEY: u8 = 0x1d;
+/// Window during which a follow-up key is accepted before we give up
+/// and forward the prefix byte to the child verbatim.
+const PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
 
 use crate::block::{Block, BlockSource};
 use crate::claude_feeder;
@@ -129,6 +140,9 @@ impl App {
         let mut buf = [0u8; 8192];
         let mut stdout = io::stdout();
         let mut mode = Mode::Normal;
+        // Some(instant) while we're waiting for the second key of a prefix
+        // command. None otherwise.
+        let mut prefix_since: Option<Instant> = None;
 
         // Terminal used only while an overlay is active.
         let mut overlay_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
@@ -158,8 +172,28 @@ impl App {
                 }
             }
 
+            // Prefix timeout: the user pressed Ctrl+] but never followed up.
+            // Deliver the Ctrl+] to the child so things like readline
+            // (Ctrl+] is the emacs-mode char-search binding) still work.
+            if let Some(t) = prefix_since {
+                if t.elapsed() >= PREFIX_TIMEOUT {
+                    proxy.write_input(&[PREFIX_KEY])?;
+                    prefix_since = None;
+                }
+            }
+
+            // Shorten the poll so the timeout above fires close to 500ms
+            // instead of up to 580ms. Default 80ms tick otherwise.
+            let poll_timeout = match prefix_since {
+                Some(t) => {
+                    let remaining = PREFIX_TIMEOUT.saturating_sub(t.elapsed());
+                    remaining.min(Duration::from_millis(80))
+                }
+                None => Duration::from_millis(80),
+            };
+
             events.clear();
-            poller.wait(&mut events, Some(Duration::from_millis(80)))?;
+            poller.wait(&mut events, Some(poll_timeout))?;
 
             for ev in events.iter() {
                 if ev.key == PTY_KEY {
@@ -197,6 +231,7 @@ impl App {
                                 &mut mode,
                                 &mut proxy,
                                 &mut overlay_term,
+                                &mut prefix_since,
                             )?;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -232,34 +267,43 @@ fn handle_input(
     mode: &mut Mode,
     proxy: &mut PtyProxy,
     overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    prefix_since: &mut Option<Instant>,
 ) -> Result<()> {
     match mode {
         Mode::Normal => {
             let mut passthrough: Vec<u8> = Vec::with_capacity(bytes.len());
-            for &b in bytes {
-                match b {
-                    0x02 => {
-                        enter_overlay(mode, overlay_term, proxy, OverlayView::List)?;
-                        break;
+            let mut iter = bytes.iter().copied();
+            while let Some(b) = iter.next() {
+                // Follow-up key after the prefix.
+                if prefix_since.is_some() {
+                    *prefix_since = None;
+                    if !passthrough.is_empty() {
+                        proxy.write_input(&passthrough)?;
+                        passthrough.clear();
                     }
-                    0x06 => {
-                        enter_overlay(mode, overlay_term, proxy, OverlayView::Search)?;
-                        break;
+                    match dispatch_prefix(b, mode, proxy, overlay_term)? {
+                        PrefixOutcome::Handled => {}
+                        PrefixOutcome::Passthrough(bytes_to_send) => {
+                            proxy.write_input(&bytes_to_send)?;
+                        }
+                        PrefixOutcome::EnteredOverlay => {
+                            // Any remaining bytes in this batch belong to the
+                            // overlay now — feed them through the overlay path.
+                            let rest: Vec<u8> = iter.collect();
+                            if !rest.is_empty() {
+                                handle_overlay_bytes(&rest, mode, proxy, overlay_term)?;
+                            }
+                            return Ok(());
+                        }
                     }
-                    0x05 => {
-                        let json = proxy.blocks().export_json();
-                        let path = format!(
-                            "ptylenz-{}.json",
-                            chrono::Local::now().format("%Y%m%d-%H%M%S")
-                        );
-                        std::fs::write(&path, json)?;
-                        eprint!(
-                            "\r\n[ptylenz] exported {} blocks → {}\r\n",
-                            proxy.blocks().block_count(),
-                            path
-                        );
+                } else if b == PREFIX_KEY {
+                    if !passthrough.is_empty() {
+                        proxy.write_input(&passthrough)?;
+                        passthrough.clear();
                     }
-                    _ => passthrough.push(b),
+                    *prefix_since = Some(Instant::now());
+                } else {
+                    passthrough.push(b);
                 }
             }
             if !passthrough.is_empty() {
@@ -275,6 +319,69 @@ fn handle_input(
         }
     }
     Ok(())
+}
+
+/// Result of consuming a post-prefix key.
+enum PrefixOutcome {
+    /// Command handled fully inside Normal mode (no overlay, no passthrough).
+    Handled,
+    /// The command is a passthrough to the child — these bytes should be
+    /// written to the PTY master.
+    Passthrough(Vec<u8>),
+    /// Switched into overlay mode. Remaining batch bytes, if any, should be
+    /// forwarded to the overlay handler rather than the shell.
+    EnteredOverlay,
+}
+
+fn dispatch_prefix(
+    key: u8,
+    mode: &mut Mode,
+    proxy: &mut PtyProxy,
+    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+) -> Result<PrefixOutcome> {
+    match key {
+        b'b' => {
+            enter_overlay(mode, overlay_term, proxy, OverlayView::List)?;
+            Ok(PrefixOutcome::EnteredOverlay)
+        }
+        b'/' => {
+            enter_overlay(mode, overlay_term, proxy, OverlayView::Search)?;
+            Ok(PrefixOutcome::EnteredOverlay)
+        }
+        b'e' => {
+            let json = proxy.blocks().export_json();
+            let path = format!(
+                "ptylenz-{}.json",
+                chrono::Local::now().format("%Y%m%d-%H%M%S")
+            );
+            std::fs::write(&path, json)?;
+            eprint!(
+                "\r\n[ptylenz] exported {} blocks → {}\r\n",
+                proxy.blocks().block_count(),
+                path
+            );
+            Ok(PrefixOutcome::Handled)
+        }
+        b'y' => {
+            let count = proxy.blocks().block_count();
+            if count > 0 {
+                if let Some(block) = proxy.blocks().get_block_by_index(count - 1) {
+                    let id = block.id;
+                    let text = block.output_text();
+                    copy_to_clipboard(&text);
+                    eprint!("\r\n[ptylenz] copied block #{}\r\n", id);
+                }
+            }
+            Ok(PrefixOutcome::Handled)
+        }
+        PREFIX_KEY => {
+            // prefix + ] — explicit escape hatch to send a literal Ctrl+].
+            Ok(PrefixOutcome::Passthrough(vec![PREFIX_KEY]))
+        }
+        // Unknown key: drop the prefix silently and forward the key as-is.
+        // tmux-ish behavior; avoids injecting surprise control bytes.
+        other => Ok(PrefixOutcome::Passthrough(vec![other])),
+    }
 }
 
 fn enter_overlay(
