@@ -1,24 +1,24 @@
-///! Block Engine — segments a PTY byte stream into discrete blocks.
-///!
-///! A "block" is one command invocation and its output:
-///!   - command text (from OSC 133;E)
-///!   - output bytes (everything between OSC 133;C and OSC 133;D)
-///!   - exit code (from OSC 133;D)
-///!   - timestamp
-///!   - line count
-///!
-///! Detection uses iTerm2/Warp-compatible OSC 133 sequences:
-///!   \e]133;A\a  — prompt start (new prompt displayed)
-///!   \e]133;C\a  — command execution start
-///!   \e]133;D;N\a — command finished with exit code N
-///!   \e]133;E;cmd\a — command text
-///!
-///! When OSC markers are absent (no shell integration), the engine
-///! falls back to prompt-pattern detection (configurable regex).
+//! Block Engine — segments a PTY byte stream into discrete blocks.
+//!
+//! A "block" is one command invocation and its output:
+//!   - command text (from OSC 133;E)
+//!   - output bytes (between OSC 133;C and OSC 133;D)
+//!   - exit code (from OSC 133;D)
+//!   - timestamp, line count
+//!
+//! Detection uses iTerm2/Warp-compatible OSC 133 sequences:
+//!   \e]133;A\a  — prompt start
+//!   \e]133;C\a  — command execution start
+//!   \e]133;D;N\a — command finished with exit code N
+//!   \e]133;E;cmd\a — command text
+//!
+//! Some helpers (preview, summary, toggle_*, pinned) are part of the MVP
+//! roadmap and kept intentionally even if not yet wired into the TUI.
+
+#![allow(dead_code)]
 
 use chrono::{DateTime, Local};
 use regex::bytes::Regex;
-use std::fmt;
 
 /// Events detected in the PTY output stream.
 #[derive(Debug, Clone)]
@@ -114,19 +114,15 @@ impl BlockEngine {
 
     /// Set a fallback prompt regex for non-integrated shells.
     pub fn set_prompt_pattern(&mut self, pattern: &str) {
-        self.prompt_pattern = Regex::new(pattern.as_bytes()).ok();
+        self.prompt_pattern = Regex::new(pattern).ok();
     }
 
     /// Feed raw PTY output bytes into the engine.
-    /// Returns any OSC events detected.
-    pub fn feed_output(&mut self, data: &[u8]) -> Vec<OscEvent> {
-        let mut events = Vec::new();
-
-        // Parse OSC sequences from the byte stream
+    /// Returns the clean stream (OSC 133 markers stripped) plus any events
+    /// detected, so callers can forward the clean bytes to stdout.
+    pub fn feed_output(&mut self, data: &[u8]) -> (Vec<u8>, Vec<OscEvent>) {
         let (clean_data, osc_events) = self.osc_parser.parse(data);
-        events.extend(osc_events.clone());
 
-        // Process events to manage blocks
         for event in &osc_events {
             match event {
                 OscEvent::CommandStart => {
@@ -136,8 +132,16 @@ impl BlockEngine {
                     self.current = Some(block);
                 }
                 OscEvent::CommandText(cmd) => {
+                    // The iTerm2 protocol emits 133;E at prompt time; our bash
+                    // integration emits it from PROMPT_COMMAND (after CommandEnd),
+                    // so attach to the current block if open, else to the last
+                    // closed block.
                     if let Some(ref mut block) = self.current {
                         block.command = Some(cmd.clone());
+                    } else if let Some(last) = self.blocks.last_mut() {
+                        if last.command.is_none() {
+                            last.command = Some(cmd.clone());
+                        }
                     }
                 }
                 OscEvent::CommandEnd { exit_code } => {
@@ -164,12 +168,11 @@ impl BlockEngine {
             }
         }
 
-        // Append clean data to current block
         if let Some(ref mut block) = self.current {
             block.output.extend_from_slice(&clean_data);
         }
 
-        events
+        (clean_data, osc_events)
     }
 
     /// Get all completed blocks.
@@ -236,22 +239,89 @@ impl BlockEngine {
         self.blocks.len() + if self.current.is_some() { 1 } else { 0 }
     }
 
-    /// Export all blocks as JSON.
+    /// Export the session in the common log model format used by
+    /// claude-session-replay. Each block becomes a pair of messages
+    /// (user = command, assistant = output). An extra `exit_code` field
+    /// is attached to assistant messages as a backwards-compatible extension.
+    ///
+    /// See `github.com/opaopa6969/claude-session-replay/docs/data-model.md`.
     pub fn export_json(&self) -> String {
-        let mut entries = Vec::new();
-        for block in &self.blocks {
-            entries.push(format!(
-                r#"  {{"id": {}, "command": {:?}, "exit_code": {:?}, "lines": {}, "started": {:?}, "output_preview": {:?}}}"#,
-                block.id,
-                block.command,
-                block.exit_code,
-                block.line_count(),
-                block.started_at.to_rfc3339(),
-                block.preview(5),
-            ));
+        let source = format!(
+            "ptylenz-{}.json",
+            Local::now().format("%Y%m%d-%H%M%S")
+        );
+
+        let mut messages = String::new();
+        let mut first = true;
+
+        let all_blocks = self.blocks.iter().chain(self.current.iter());
+        for block in all_blocks {
+            let ts = block.started_at.to_rfc3339();
+            let cmd = block.command.clone().unwrap_or_default();
+            let out = block.output_text();
+
+            if !cmd.is_empty() {
+                if !first {
+                    messages.push_str(",\n");
+                }
+                first = false;
+                messages.push_str(&format_message("user", &cmd, &ts, None));
+            }
+            if !out.is_empty() || block.exit_code.is_some() {
+                if !first {
+                    messages.push_str(",\n");
+                }
+                first = false;
+                let ts_end = block
+                    .ended_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| ts.clone());
+                messages.push_str(&format_message(
+                    "assistant",
+                    &out,
+                    &ts_end,
+                    block.exit_code,
+                ));
+            }
         }
-        format!("[\n{}\n]", entries.join(",\n"))
+
+        format!(
+            "{{\n  \"source\": \"{}\",\n  \"agent\": \"ptylenz\",\n  \"messages\": [\n{}\n  ]\n}}",
+            json_escape(&source),
+            messages
+        )
     }
+}
+
+fn format_message(role: &str, text: &str, ts: &str, exit_code: Option<i32>) -> String {
+    let mut extra = String::new();
+    if let Some(code) = exit_code {
+        extra.push_str(&format!(",\n      \"exit_code\": {code}"));
+    }
+    format!(
+        "    {{\n      \"role\": \"{}\",\n      \"text\": \"{}\",\n      \"tool_uses\": [],\n      \"tool_results\": [],\n      \"thinking\": [],\n      \"timestamp\": \"{}\"{extra}\n    }}",
+        role,
+        json_escape(text),
+        json_escape(ts)
+    )
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// OSC escape sequence parser.
@@ -457,6 +527,35 @@ mod tests {
         let results = engine.search("world");
         assert_eq!(results.len(), 1);
         assert!(results[0].2.contains("world"));
+    }
+
+    #[test]
+    fn test_export_common_model_json() {
+        let mut engine = BlockEngine::new();
+
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"file1.txt\nfile2.txt\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+        engine.feed_output(b"\x1b]133;E;ls\x07");
+
+        let json = engine.export_json();
+        // Basic structural checks — schema is defined by claude-session-replay.
+        assert!(json.contains("\"agent\": \"ptylenz\""));
+        assert!(json.contains("\"messages\":"));
+        assert!(json.contains("\"role\": \"user\""));
+        assert!(json.contains("\"text\": \"ls\""));
+        assert!(json.contains("\"role\": \"assistant\""));
+        assert!(json.contains("file1.txt"));
+        assert!(json.contains("\"exit_code\": 0"));
+        // Invariant: no trailing comma before closing bracket.
+        assert!(!json.contains(",\n  ]"));
+    }
+
+    #[test]
+    fn test_json_escape_handles_quotes_and_newlines() {
+        let s = "line1\n\"quoted\"\tpath\\with\\slash";
+        let e = json_escape(s);
+        assert_eq!(e, "line1\\n\\\"quoted\\\"\\tpath\\\\with\\\\slash");
     }
 
     #[test]

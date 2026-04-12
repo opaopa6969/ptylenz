@@ -1,5 +1,7 @@
 /target
+Cargo.lock
 
 *.swp
 *.swo
+*:Zone.Identifier
 ptylenz-*.json

@@ -13,31 +13,37 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::PathBuf;
 
 use crate::block::{BlockEngine, OscEvent};
 
-/// Shell integration script injected into bash to emit OSC markers.
-/// These markers let ptylenz know where each command starts/ends.
+/// Shell integration script injected into bash to emit OSC 133 markers.
+/// Uses PS0 + PS1 + PROMPT_COMMAND (iTerm2-style) to avoid DEBUG-trap
+/// nesting issues when functions call other commands.
+///
+///   133;A — prompt start (printed via PS1)
+///   133;C — command execution start (printed via PS0)
+///   133;D;N — command finished with exit code N (via PROMPT_COMMAND)
+///   133;E;cmd — command text (via PROMPT_COMMAND, from last history entry)
 const BASH_INTEGRATION: &str = r#"
 # ptylenz shell integration — do not edit
-__ptylenz_preexec() {
-    # OSC 133;C = command execution start
-    printf '\e]133;C\a'
-    # OSC 133;E = command text (for block title)
-    printf '\e]133;E;%s\a' "$1"
-}
 __ptylenz_precmd() {
-    local exit_code=$?
-    # OSC 133;D = command finished, with exit code
-    printf '\e]133;D;%d\a' "$exit_code"
-    # OSC 133;A = new prompt starting
-    printf '\e]133;A\a'
+    local __ptylenz_ec=$?
+    printf '\e]133;D;%d\a' "$__ptylenz_ec"
+    local __ptylenz_last
+    __ptylenz_last=$(HISTTIMEFORMAT='' history 1 2>/dev/null | sed -E 's/^[[:space:]]*[0-9]+[[:space:]]*//')
+    if [ -n "$__ptylenz_last" ]; then
+        printf '\e]133;E;%s\a' "$__ptylenz_last"
+    fi
 }
-trap '__ptylenz_preexec "$BASH_COMMAND"' DEBUG
 PROMPT_COMMAND='__ptylenz_precmd'
+PS0='\[\e]133;C\a\]'
+case "$PS1" in
+  *'133;A'*) ;;
+  *) PS1='\[\e]133;A\a\]'"$PS1" ;;
+esac
 "#;
 
 /// The PTY proxy: owns the master side of a PTY pair and
@@ -51,6 +57,11 @@ pub struct PtyProxy {
 impl PtyProxy {
     /// Spawn a child shell inside a new PTY, with shell integration.
     pub fn spawn(shell_path: &str) -> Result<Self> {
+        // Write shell integration to a temp rcfile that also sources user's ~/.bashrc.
+        // Using --rcfile with a wrapper preserves the user's bash environment while
+        // letting us inject the OSC 133 markers we need for block detection.
+        let rcfile = write_bash_rcfile()?;
+
         // Create PTY pair
         let OpenptyResult { master, slave } = openpty(None, None)
             .context("Failed to open PTY pair")?;
@@ -59,41 +70,29 @@ impl PtyProxy {
 
         match unsafe { unistd::fork() }.context("fork failed")? {
             ForkResult::Child => {
-                // Child: become session leader, attach to slave PTY
                 drop(master);
                 unistd::setsid().ok();
 
-                // Make slave PTY the controlling terminal
                 unsafe {
                     libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0);
                 }
 
-                // Redirect stdin/stdout/stderr to slave PTY
                 unistd::dup2(slave.as_raw_fd(), 0).ok();
                 unistd::dup2(slave.as_raw_fd(), 1).ok();
                 unistd::dup2(slave.as_raw_fd(), 2).ok();
                 drop(slave);
 
-                // Set environment hint
                 std::env::set_var("PTYLENZ", "1");
                 std::env::set_var("PTYLENZ_VERSION", env!("CARGO_PKG_VERSION"));
 
-                // Exec the shell with integration
-                // We use --rcfile to inject our integration alongside user's bashrc
                 let shell = CString::new(shell_path).unwrap();
-                let init_cmd = format!(
-                    "source ~/.bashrc 2>/dev/null; {}",
-                    BASH_INTEGRATION
-                );
+                let rcfile_path = CString::new(rcfile.to_string_lossy().as_bytes()).unwrap();
                 let args = [
                     shell.clone(),
                     CString::new("--rcfile").unwrap(),
-                    CString::new("/dev/null").unwrap(),
+                    rcfile_path,
                     CString::new("-i").unwrap(),
                 ];
-
-                // Alternative: pass integration via BASH_ENV or --init-file
-                std::env::set_var("PTYLENZ_INIT", BASH_INTEGRATION);
 
                 unistd::execvp(&shell, &args).ok();
                 std::process::exit(127);
@@ -115,16 +114,17 @@ impl PtyProxy {
     }
 
     /// Read from the PTY master (child's output).
-    /// Returns the raw bytes and any detected OSC events.
-    pub fn read_output(&mut self, buf: &mut [u8]) -> Result<(usize, Vec<OscEvent>)> {
+    /// Returns (clean_bytes_without_osc_133, detected_events).
+    /// The clean bytes are safe to forward directly to the user's terminal.
+    pub fn read_output(&mut self, buf: &mut [u8]) -> Result<(Vec<u8>, Vec<OscEvent>)> {
         let n = unistd::read(self.master.as_raw_fd(), buf)
             .context("read from PTY master")?;
         if n == 0 {
-            return Ok((0, vec![]));
+            return Ok((Vec::new(), Vec::new()));
         }
 
-        let events = self.block_engine.feed_output(&buf[..n]);
-        Ok((n, events))
+        let (clean, events) = self.block_engine.feed_output(&buf[..n]);
+        Ok((clean, events))
     }
 
     /// Write to the PTY master (user's input → child's stdin).
@@ -170,6 +170,7 @@ impl PtyProxy {
         &self.block_engine
     }
 
+    #[allow(dead_code)]
     pub fn blocks_mut(&mut self) -> &mut BlockEngine {
         &mut self.block_engine
     }
@@ -177,7 +178,84 @@ impl PtyProxy {
 
 impl Drop for PtyProxy {
     fn drop(&mut self) {
-        // Try graceful shutdown
         self.signal_child(Signal::SIGHUP).ok();
+    }
+}
+
+/// Write a wrapper rcfile for bash that sources the user's ~/.bashrc then
+/// installs our OSC 133 emitters. Returns the path to the tempfile.
+fn write_bash_rcfile() -> Result<PathBuf> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("ptylenz-rc-{}.sh", std::process::id()));
+
+    let contents = format!(
+        "# ptylenz wrapper rcfile — auto-generated, safe to delete\n\
+         [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
+         {}",
+        BASH_INTEGRATION
+    );
+
+    let mut f = std::fs::File::create(&path)
+        .with_context(|| format!("create rcfile {:?}", path))?;
+    f.write_all(contents.as_bytes())
+        .context("write rcfile contents")?;
+    Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// End-to-end: spawn bash under the proxy, drive a few commands, confirm
+    /// the block engine picks them up with exit codes and command text.
+    #[test]
+    fn spawn_bash_and_detect_blocks() {
+        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Drain output in a loop until we see the first prompt marker,
+        // then send commands and drain again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        unsafe {
+            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
+            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Give bash a moment to print its first prompt
+        thread::sleep(Duration::from_millis(400));
+        let _ = proxy.read_output(&mut buf);
+
+        proxy.write_input(b"echo hello-ptylenz\n").unwrap();
+        proxy.write_input(b"false\n").unwrap();
+        proxy.write_input(b"exit\n").unwrap();
+
+        while Instant::now() < deadline {
+            match proxy.read_output(&mut buf) {
+                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            if !proxy.child_alive() {
+                let _ = proxy.read_output(&mut buf);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let blocks = proxy.blocks().completed_blocks();
+        assert!(
+            !blocks.is_empty(),
+            "expected at least one block after driving bash"
+        );
+        // We should have seen `echo hello-ptylenz` somewhere
+        let any_echo = blocks
+            .iter()
+            .any(|b| b.command.as_deref().map_or(false, |c| c.contains("echo hello-ptylenz")));
+        assert!(any_echo, "expected to capture the echo command; blocks={:?}", blocks.iter().map(|b| &b.command).collect::<Vec<_>>());
     }
 }

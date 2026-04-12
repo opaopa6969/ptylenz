@@ -14,8 +14,11 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # PTY
-rustix = { version = "0.38", features = ["termios", "process", "pipe"] }
-nix = { version = "0.29", features = ["pty", "signal", "process"] }
+nix = { version = "0.29", features = ["term", "process", "signal", "poll", "fs"] }
+libc = "0.2"
+
+# Event loop multiplexing (stdin + PTY master fd)
+polling = "3"
 
 # Utilities
 anyhow = "1"
