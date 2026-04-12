@@ -1,33 +1,29 @@
 ///! TUI Application — main event loop and renderer.
 ///!
-///! Two visual modes:
-///!   - Normal: transparent passthrough. PTY output (with OSC 133 stripped)
-///!     is written directly to stdout, and keystrokes flow to bash. ptylenz
+///! Two modes, no chord/prefix soup:
+///!   - Normal: full passthrough. Every keystroke except Ctrl+] goes to
+///!     bash; PTY output (OSC-stripped) flows straight to stdout. ptylenz
 ///!     is invisible.
-///!   - Overlay: on Ctrl+B, we switch into the alternate screen and draw
-///!     a ratatui block-list/detail UI. Leaving the overlay restores the
-///!     primary screen untouched.
+///!   - Ptylenz: alt-screen overlay rendered by ratatui. bash keeps running
+///!     in the background but its stdin is paused while we own the terminal.
 ///!
-///! The main loop multiplexes the PTY master fd and stdin via `polling`
-///! so we never spin-wait on either source.
+///! Only one keystroke in Normal mode is ever intercepted: Ctrl+]
+///! (0x1d). Pressing it enters Ptylenz mode; pressing it again (or q / Esc)
+///! leaves.
 ///!
-///! Key bindings (Normal mode, tmux-style prefix):
-///!   Ctrl+]    prefix. After it, within 500ms:
-///!     b       open block-nav overlay
-///!     /       open search overlay
-///!     e       export blocks to JSON (current dir)
-///!     y       copy most recent block to clipboard
-///!     ]       send a literal Ctrl+] through to the child
-///!   If no follow-up key arrives in time, the Ctrl+] itself is
-///!   delivered to the child so readline bindings etc. still work.
-///!
-///! Key bindings (overlay):
-///!   q / Esc  close overlay (or: in detail view, go back to list)
-///!   j / ↓    next block / scroll down
-///!   k / ↑    prev block / scroll up
-///!   Enter    list → detail view
-///!   y        copy focused block to clipboard (OSC 52 + xclip/pbcopy)
-///!   /        (block-nav) search across all blocks
+///! Ptylenz-mode keys:
+///!   j / ↓         next block
+///!   k / ↑         previous block
+///!   g             jump to first block
+///!   G             jump to last block
+///!   Enter         toggle expand/collapse of selected block
+///!   /             search sub-mode
+///!   n             next search result
+///!   N             previous search result
+///!   y             copy selected block's output to clipboard
+///!   e             export all blocks as JSON (current dir)
+///!   p             toggle pin on selected block
+///!   q / Esc / Ctrl+]   back to Normal
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -40,19 +36,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block as RBlock, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block as RBlock, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 use std::io::{self, Write};
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-/// Prefix key (Ctrl+]) — initiates a tmux-style command sequence.
-const PREFIX_KEY: u8 = 0x1d;
-/// Window during which a follow-up key is accepted before we give up
-/// and forward the prefix byte to the child verbatim.
-const PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
+use std::time::Duration;
 
 use crate::block::{Block, BlockSource};
 use crate::claude_feeder;
@@ -60,6 +50,16 @@ use crate::pty::PtyProxy;
 
 const STDIN_KEY: usize = 0;
 const PTY_KEY: usize = 1;
+
+/// The one key ptylenz claims out of Normal mode. Ctrl+] (ASCII GS, 0x1d).
+/// Chosen because no common shell/editor uses it and tmux uses Ctrl+B by
+/// default, so it doesn't collide.
+const MODE_SWITCH_KEY: u8 = 0x1d;
+
+/// Max output lines rendered inline when a block is expanded. Anything
+/// beyond this is truncated with an ellipsis — the block still exists
+/// in full and can be exported via `e`.
+const EXPAND_MAX_LINES: usize = 200;
 
 static RESIZED: AtomicBool = AtomicBool::new(false);
 
@@ -73,22 +73,27 @@ fn install_sigwinch_handler() {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum OverlayView {
-    List,
-    Detail,
-    Search,
+/// Persistent search state inside Ptylenz mode. Survives exiting the
+/// search sub-mode so `n`/`N` keep working on the last result set.
+#[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    results: Vec<(usize, usize, String)>,
+    result_index: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum Mode {
     Normal,
-    Overlay {
-        view: OverlayView,
+    Ptylenz {
         selected: usize,
-        detail_scroll: u16,
-        query: String,
-        results: Vec<(usize, usize, String)>,
+        /// Some while the user is typing a search query (`/` pressed).
+        /// None otherwise — including after Enter, when we fall back to
+        /// the block list with `last_search` populated for n/N.
+        search_input: Option<String>,
+        /// Populated after a search is run. n/N cycle through its results
+        /// until a new search is started or the user leaves Ptylenz mode.
+        last_search: Option<SearchState>,
     },
 }
 
@@ -110,10 +115,6 @@ impl App {
 
         install_sigwinch_handler();
 
-        // Start watching Claude Code's JSONL for the current cwd so that
-        // `claude` sessions launched from the inner shell become per-turn
-        // blocks instead of one opaque alt-screen dump. Silent-fail if the
-        // env gives us no HOME or the user never runs claude.
         let claude_rx = match std::env::current_dir() {
             Ok(cwd) => claude_feeder::spawn_watcher(&cwd),
             Err(_) => std::sync::mpsc::channel().1,
@@ -140,12 +141,9 @@ impl App {
         let mut buf = [0u8; 8192];
         let mut stdout = io::stdout();
         let mut mode = Mode::Normal;
-        // Some(instant) while we're waiting for the second key of a prefix
-        // command. None otherwise.
-        let mut prefix_since: Option<Instant> = None;
 
-        // Terminal used only while an overlay is active.
-        let mut overlay_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
+        // Alt-screen terminal — only exists while Ptylenz mode is active.
+        let mut ptylenz_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
 
         loop {
             if !proxy.child_alive() {
@@ -155,15 +153,12 @@ impl App {
             if RESIZED.swap(false, Ordering::Relaxed) {
                 if let Some((cols, rows)) = terminal_size() {
                     proxy.resize(cols, rows).ok();
-                    if let Some(term) = overlay_term.as_mut() {
+                    if let Some(term) = ptylenz_term.as_mut() {
                         term.autoresize().ok();
                     }
                 }
             }
 
-            // Drain any Claude turn events that arrived since the last tick.
-            // try_recv is non-blocking; Disconnected means the watcher thread
-            // exited (e.g. bad HOME) and we just stop listening.
             loop {
                 match claude_rx.try_recv() {
                     Ok(ev) => proxy.blocks_mut().ingest_claude_event(ev),
@@ -172,28 +167,8 @@ impl App {
                 }
             }
 
-            // Prefix timeout: the user pressed Ctrl+] but never followed up.
-            // Deliver the Ctrl+] to the child so things like readline
-            // (Ctrl+] is the emacs-mode char-search binding) still work.
-            if let Some(t) = prefix_since {
-                if t.elapsed() >= PREFIX_TIMEOUT {
-                    proxy.write_input(&[PREFIX_KEY])?;
-                    prefix_since = None;
-                }
-            }
-
-            // Shorten the poll so the timeout above fires close to 500ms
-            // instead of up to 580ms. Default 80ms tick otherwise.
-            let poll_timeout = match prefix_since {
-                Some(t) => {
-                    let remaining = PREFIX_TIMEOUT.saturating_sub(t.elapsed());
-                    remaining.min(Duration::from_millis(80))
-                }
-                None => Duration::from_millis(80),
-            };
-
             events.clear();
-            poller.wait(&mut events, Some(poll_timeout))?;
+            poller.wait(&mut events, Some(Duration::from_millis(80)))?;
 
             for ev in events.iter() {
                 if ev.key == PTY_KEY {
@@ -208,9 +183,9 @@ impl App {
                                 stdout.write_all(&clean)?;
                                 stdout.flush()?;
                             }
-                            // In overlay mode we keep reading (so the block
-                            // engine stays fresh) but don't paint output over
-                            // the alt screen.
+                            // Ptylenz mode: the block engine still consumes
+                            // the bytes (done inside read_output), but we
+                            // don't paint them over the alt-screen UI.
                         }
                         Err(e) => {
                             let msg = format!("{e}");
@@ -230,8 +205,7 @@ impl App {
                                 &sbuf[..n],
                                 &mut mode,
                                 &mut proxy,
-                                &mut overlay_term,
-                                &mut prefix_since,
+                                &mut ptylenz_term,
                             )?;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -240,16 +214,14 @@ impl App {
                 }
             }
 
-            // Redraw overlay on every loop tick (covers resize + block updates).
-            if matches!(mode, Mode::Overlay { .. }) {
-                if let Some(term) = overlay_term.as_mut() {
-                    draw_overlay(term, &mode, &proxy)?;
+            if matches!(mode, Mode::Ptylenz { .. }) {
+                if let Some(term) = ptylenz_term.as_mut() {
+                    draw_ptylenz(term, &mode, &proxy)?;
                 }
             }
         }
 
-        // Make sure we're not stuck in the alt screen on exit.
-        if let Some(mut term) = overlay_term.take() {
+        if let Some(mut term) = ptylenz_term.take() {
             let _ = term.show_cursor();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
@@ -266,129 +238,45 @@ fn handle_input(
     bytes: &[u8],
     mode: &mut Mode,
     proxy: &mut PtyProxy,
-    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
-    prefix_since: &mut Option<Instant>,
+    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
 ) -> Result<()> {
     match mode {
         Mode::Normal => {
-            let mut passthrough: Vec<u8> = Vec::with_capacity(bytes.len());
+            let mut pass: Vec<u8> = Vec::with_capacity(bytes.len());
             let mut iter = bytes.iter().copied();
             while let Some(b) = iter.next() {
-                // Follow-up key after the prefix.
-                if prefix_since.is_some() {
-                    *prefix_since = None;
-                    if !passthrough.is_empty() {
-                        proxy.write_input(&passthrough)?;
-                        passthrough.clear();
+                if b == MODE_SWITCH_KEY {
+                    if !pass.is_empty() {
+                        proxy.write_input(&pass)?;
+                        pass.clear();
                     }
-                    match dispatch_prefix(b, mode, proxy, overlay_term)? {
-                        PrefixOutcome::Handled => {}
-                        PrefixOutcome::Passthrough(bytes_to_send) => {
-                            proxy.write_input(&bytes_to_send)?;
-                        }
-                        PrefixOutcome::EnteredOverlay => {
-                            // Any remaining bytes in this batch belong to the
-                            // overlay now — feed them through the overlay path.
-                            let rest: Vec<u8> = iter.collect();
-                            if !rest.is_empty() {
-                                handle_overlay_bytes(&rest, mode, proxy, overlay_term)?;
-                            }
-                            return Ok(());
-                        }
+                    enter_ptylenz(mode, ptylenz_term, proxy)?;
+                    // Any keys that came in the same batch after Ctrl+]
+                    // should be interpreted by the Ptylenz mode handler,
+                    // not lost or sent to the shell.
+                    let rest: Vec<u8> = iter.collect();
+                    if !rest.is_empty() {
+                        handle_ptylenz_bytes(&rest, mode, proxy, ptylenz_term)?;
                     }
-                } else if b == PREFIX_KEY {
-                    if !passthrough.is_empty() {
-                        proxy.write_input(&passthrough)?;
-                        passthrough.clear();
-                    }
-                    *prefix_since = Some(Instant::now());
-                } else {
-                    passthrough.push(b);
+                    return Ok(());
                 }
+                pass.push(b);
             }
-            if !passthrough.is_empty() {
-                proxy.write_input(&passthrough)?;
+            if !pass.is_empty() {
+                proxy.write_input(&pass)?;
             }
         }
-        Mode::Overlay { .. } => {
-            // Re-interpret the bytes via crossterm's key parser for convenience.
-            // Bytes were already delivered to stdin; we poll crossterm here
-            // non-blockingly (it may or may not have the events depending on
-            // timing, so we ALSO parse raw bytes directly for reliability).
-            handle_overlay_bytes(bytes, mode, proxy, overlay_term)?;
+        Mode::Ptylenz { .. } => {
+            handle_ptylenz_bytes(bytes, mode, proxy, ptylenz_term)?;
         }
     }
     Ok(())
 }
 
-/// Result of consuming a post-prefix key.
-enum PrefixOutcome {
-    /// Command handled fully inside Normal mode (no overlay, no passthrough).
-    Handled,
-    /// The command is a passthrough to the child — these bytes should be
-    /// written to the PTY master.
-    Passthrough(Vec<u8>),
-    /// Switched into overlay mode. Remaining batch bytes, if any, should be
-    /// forwarded to the overlay handler rather than the shell.
-    EnteredOverlay,
-}
-
-fn dispatch_prefix(
-    key: u8,
+fn enter_ptylenz(
     mode: &mut Mode,
-    proxy: &mut PtyProxy,
-    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
-) -> Result<PrefixOutcome> {
-    match key {
-        b'b' => {
-            enter_overlay(mode, overlay_term, proxy, OverlayView::List)?;
-            Ok(PrefixOutcome::EnteredOverlay)
-        }
-        b'/' => {
-            enter_overlay(mode, overlay_term, proxy, OverlayView::Search)?;
-            Ok(PrefixOutcome::EnteredOverlay)
-        }
-        b'e' => {
-            let json = proxy.blocks().export_json();
-            let path = format!(
-                "ptylenz-{}.json",
-                chrono::Local::now().format("%Y%m%d-%H%M%S")
-            );
-            std::fs::write(&path, json)?;
-            eprint!(
-                "\r\n[ptylenz] exported {} blocks → {}\r\n",
-                proxy.blocks().block_count(),
-                path
-            );
-            Ok(PrefixOutcome::Handled)
-        }
-        b'y' => {
-            let count = proxy.blocks().block_count();
-            if count > 0 {
-                if let Some(block) = proxy.blocks().get_block_by_index(count - 1) {
-                    let id = block.id;
-                    let text = block.output_text();
-                    copy_to_clipboard(&text);
-                    eprint!("\r\n[ptylenz] copied block #{}\r\n", id);
-                }
-            }
-            Ok(PrefixOutcome::Handled)
-        }
-        PREFIX_KEY => {
-            // prefix + ] — explicit escape hatch to send a literal Ctrl+].
-            Ok(PrefixOutcome::Passthrough(vec![PREFIX_KEY]))
-        }
-        // Unknown key: drop the prefix silently and forward the key as-is.
-        // tmux-ish behavior; avoids injecting surprise control bytes.
-        other => Ok(PrefixOutcome::Passthrough(vec![other])),
-    }
-}
-
-fn enter_overlay(
-    mode: &mut Mode,
-    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
     proxy: &PtyProxy,
-    view: OverlayView,
 ) -> Result<()> {
     let count = proxy.blocks().block_count();
     let selected = count.saturating_sub(1);
@@ -398,24 +286,22 @@ fn enter_overlay(
     let mut term = Terminal::new(backend).context("create terminal")?;
     term.hide_cursor().ok();
 
-    *mode = Mode::Overlay {
-        view,
+    *mode = Mode::Ptylenz {
         selected,
-        detail_scroll: 0,
-        query: String::new(),
-        results: Vec::new(),
+        search_input: None,
+        last_search: None,
     };
 
-    draw_overlay(&mut term, mode, proxy)?;
-    *overlay_term = Some(term);
+    draw_ptylenz(&mut term, mode, proxy)?;
+    *ptylenz_term = Some(term);
     Ok(())
 }
 
-fn leave_overlay(
+fn leave_ptylenz(
     mode: &mut Mode,
-    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
 ) -> Result<()> {
-    if let Some(mut term) = overlay_term.take() {
+    if let Some(mut term) = ptylenz_term.take() {
         let _ = term.show_cursor();
     }
     execute!(io::stdout(), LeaveAlternateScreen).context("leave alt screen")?;
@@ -423,116 +309,176 @@ fn leave_overlay(
     Ok(())
 }
 
-fn handle_overlay_bytes(
+fn handle_ptylenz_bytes(
     bytes: &[u8],
     mode: &mut Mode,
     proxy: &mut PtyProxy,
-    overlay_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
 ) -> Result<()> {
-    // Decode the byte stream into (key_code, modifiers) pairs. We handle
-    // the common cases: plain chars, ESC, arrow keys (CSI A/B/C/D),
-    // backspace, enter. Anything unrecognised is ignored.
     let keys = decode_keys(bytes);
-
-    for key in keys {
-        let (code, ctrl) = key;
-        let is_escape = code == Key::Esc;
-
-        let Mode::Overlay {
-            view,
+    for (code, ctrl) in keys {
+        let Mode::Ptylenz {
             selected,
-            detail_scroll,
-            query,
-            results,
+            search_input,
+            last_search,
         } = mode
         else {
             return Ok(());
         };
 
-        match view {
-            OverlayView::List => match code {
-                Key::Char('q') | Key::Esc => {
-                    return leave_overlay(mode, overlay_term);
-                }
-                Key::Char('j') | Key::Down => {
-                    let max = proxy.blocks().block_count().saturating_sub(1);
-                    if *selected < max {
-                        *selected += 1;
-                    }
-                }
-                Key::Char('k') | Key::Up => {
-                    if *selected > 0 {
-                        *selected -= 1;
-                    }
-                }
-                Key::Enter => {
-                    *view = OverlayView::Detail;
-                    *detail_scroll = 0;
-                }
-                Key::Char('y') => {
-                    if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
-                        copy_to_clipboard(&block.output_text());
-                    }
-                }
-                Key::Char('/') => {
-                    *view = OverlayView::Search;
-                    query.clear();
-                    results.clear();
-                }
-                _ => {}
-            },
-            OverlayView::Detail => match code {
-                Key::Char('q') | Key::Esc => {
-                    *view = OverlayView::List;
-                }
-                Key::Char('j') | Key::Down => {
-                    *detail_scroll = detail_scroll.saturating_add(1);
-                }
-                Key::Char('k') | Key::Up => {
-                    *detail_scroll = detail_scroll.saturating_sub(1);
-                }
-                Key::Char('y') => {
-                    if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
-                        copy_to_clipboard(&block.output_text());
-                    }
-                }
-                _ => {}
-            },
-            OverlayView::Search => match code {
-                Key::Esc => {
-                    *view = OverlayView::List;
-                }
-                Key::Enter => {
-                    *results = proxy.blocks().search(query);
-                    // Jump selection to first hit, if any. The search result
-                    // carries a block *id*, so translate it to the index the
-                    // list view is navigating by.
-                    if let Some(first) = results.first() {
-                        if let Some(idx) = proxy.blocks().index_of_block_id(first.0) {
-                            *selected = idx;
-                        }
-                        *view = OverlayView::List;
-                    }
-                }
-                Key::Backspace => {
-                    query.pop();
-                }
-                Key::Char(c) if !ctrl => {
-                    query.push(c);
-                }
-                _ => {}
-            },
+        // Ctrl+] always leaves Ptylenz mode, regardless of sub-state.
+        if ctrl && code == Key::Char(']') {
+            return leave_ptylenz(mode, ptylenz_term);
         }
 
-        if is_escape {
-            // Extra guard: handle_input loop may have already closed overlay.
-            if matches!(mode, Mode::Normal) {
-                return Ok(());
+        if let Some(query) = search_input.as_mut() {
+            match handle_search_input(code, ctrl, query, selected, last_search, proxy) {
+                SearchInputOutcome::Continue => {}
+                SearchInputOutcome::Submitted | SearchInputOutcome::Cancelled => {
+                    *search_input = None;
+                }
             }
+            continue;
+        }
+
+        match code {
+            Key::Char('q') | Key::Esc => {
+                return leave_ptylenz(mode, ptylenz_term);
+            }
+            Key::Char('j') | Key::Down => {
+                let max = proxy.blocks().block_count().saturating_sub(1);
+                if *selected < max {
+                    *selected += 1;
+                }
+            }
+            Key::Char('k') | Key::Up => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+            }
+            Key::Char('g') => {
+                *selected = 0;
+            }
+            Key::Char('G') => {
+                *selected = proxy.blocks().block_count().saturating_sub(1);
+            }
+            Key::Enter => {
+                if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
+                    let id = block.id;
+                    proxy.blocks_mut().toggle_collapse(id);
+                }
+            }
+            Key::Char('/') => {
+                *search_input = Some(String::new());
+            }
+            Key::Char('n') => {
+                jump_search(last_search, selected, proxy, 1);
+            }
+            Key::Char('N') => {
+                jump_search(last_search, selected, proxy, -1);
+            }
+            Key::Char('y') => {
+                if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
+                    let id = block.id;
+                    let text = block.output_text();
+                    copy_to_clipboard(&text);
+                    eprint!("\r\n[ptylenz] copied block #{}\r\n", id);
+                }
+            }
+            Key::Char('e') => {
+                let json = proxy.blocks().export_json();
+                let path = format!(
+                    "ptylenz-{}.json",
+                    chrono::Local::now().format("%Y%m%d-%H%M%S")
+                );
+                std::fs::write(&path, json)?;
+                eprint!(
+                    "\r\n[ptylenz] exported {} blocks → {}\r\n",
+                    proxy.blocks().block_count(),
+                    path
+                );
+            }
+            Key::Char('p') => {
+                if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
+                    let id = block.id;
+                    proxy.blocks_mut().toggle_pin(id);
+                }
+            }
+            _ => {}
         }
     }
 
     Ok(())
+}
+
+enum SearchInputOutcome {
+    Continue,
+    Submitted,
+    Cancelled,
+}
+
+fn handle_search_input(
+    code: Key,
+    ctrl: bool,
+    query: &mut String,
+    selected: &mut usize,
+    last_search: &mut Option<SearchState>,
+    proxy: &PtyProxy,
+) -> SearchInputOutcome {
+    match code {
+        Key::Esc => {
+            // Cancel input; keep any prior last_search intact so the user
+            // can still n/N through an earlier query.
+            SearchInputOutcome::Cancelled
+        }
+        Key::Enter => {
+            let results = proxy.blocks().search(query);
+            if let Some(first) = results.first() {
+                if let Some(idx) = proxy.blocks().index_of_block_id(first.0) {
+                    *selected = idx;
+                }
+            }
+            *last_search = Some(SearchState {
+                query: std::mem::take(query),
+                results,
+                result_index: 0,
+            });
+            SearchInputOutcome::Submitted
+        }
+        Key::Backspace => {
+            query.pop();
+            SearchInputOutcome::Continue
+        }
+        Key::Char(c) if !ctrl => {
+            query.push(c);
+            SearchInputOutcome::Continue
+        }
+        _ => SearchInputOutcome::Continue,
+    }
+}
+
+/// Advance (or reverse, when `dir` is -1) the pointer into the last search
+/// result set and move the list selection to that match's block. No-ops if
+/// there is no active search or it had zero hits.
+fn jump_search(
+    last_search: &mut Option<SearchState>,
+    selected: &mut usize,
+    proxy: &PtyProxy,
+    dir: isize,
+) {
+    let Some(state) = last_search.as_mut() else {
+        return;
+    };
+    if state.results.is_empty() {
+        return;
+    }
+    let len = state.results.len() as isize;
+    let new_idx = ((state.result_index as isize + dir).rem_euclid(len)) as usize;
+    state.result_index = new_idx;
+    let target_block_id = state.results[new_idx].0;
+    if let Some(idx) = proxy.blocks().index_of_block_id(target_block_id) {
+        *selected = idx;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,7 +495,7 @@ enum Key {
     Unknown,
 }
 
-/// Minimal key decoder for overlay mode. Ctrl-modifier flag returned alongside.
+/// Minimal key decoder. Ctrl-modifier flag returned alongside.
 fn decode_keys(bytes: &[u8]) -> Vec<(Key, bool)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -557,7 +503,6 @@ fn decode_keys(bytes: &[u8]) -> Vec<(Key, bool)> {
         let b = bytes[i];
         match b {
             0x1b => {
-                // ESC — check for CSI sequence
                 if i + 2 < bytes.len() && bytes[i + 1] == b'[' {
                     let c = bytes[i + 2];
                     let key = match c {
@@ -586,6 +531,12 @@ fn decode_keys(bytes: &[u8]) -> Vec<(Key, bool)> {
                 out.push((Key::Tab, false));
                 i += 1;
             }
+            0x1d => {
+                // Ctrl+] — exposed as Char(']') with ctrl=true so the
+                // handler can recognize the "exit Ptylenz" key uniformly.
+                out.push((Key::Char(']'), true));
+                i += 1;
+            }
             0x01..=0x1a => {
                 // Ctrl+A..Ctrl+Z
                 let c = (b - 1 + b'a') as char;
@@ -597,7 +548,6 @@ fn decode_keys(bytes: &[u8]) -> Vec<(Key, bool)> {
                 i += 1;
             }
             _ => {
-                // Treat other bytes as utf-8 chars (best-effort single byte).
                 out.push((Key::Unknown, false));
                 i += 1;
             }
@@ -606,17 +556,15 @@ fn decode_keys(bytes: &[u8]) -> Vec<(Key, bool)> {
     out
 }
 
-fn draw_overlay(
+fn draw_ptylenz(
     term: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mode: &Mode,
     proxy: &PtyProxy,
 ) -> Result<()> {
-    let Mode::Overlay {
-        view,
+    let Mode::Ptylenz {
         selected,
-        detail_scroll,
-        query,
-        results,
+        search_input,
+        last_search,
     } = mode
     else {
         return Ok(());
@@ -624,32 +572,64 @@ fn draw_overlay(
 
     term.draw(|f| {
         let area = f.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(area);
 
-        match view {
-            OverlayView::List => draw_list(f, chunks[0], proxy, *selected),
-            OverlayView::Detail => draw_detail(f, chunks[0], proxy, *selected, *detail_scroll),
-            OverlayView::Search => draw_search(f, chunks[0], proxy, query, results),
+        // Optionally reserve a 3-row strip at the top for the search input.
+        let (list_area, search_bar) = if search_input.is_some() {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            (chunks[1], Some((chunks[0], chunks[2])))
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            (chunks[0], None)
+        };
+
+        if let Some((bar_area, _)) = search_bar {
+            let q = search_input.as_deref().unwrap_or("");
+            let input = Paragraph::new(q).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .title(" / search — Enter run, Esc cancel "),
+            );
+            f.render_widget(input, bar_area);
         }
 
-        let help = match view {
-            OverlayView::List => "j/k move  Enter detail  y copy  / search  q back",
-            OverlayView::Detail => "j/k scroll  y copy  q back",
-            OverlayView::Search => "type query  Enter run  Esc cancel",
+        draw_blocks(f, list_area, proxy, *selected);
+
+        let status_area = match search_bar {
+            Some((_, s)) => s,
+            None => Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(area)[1],
+        };
+
+        let help = if search_input.is_some() {
+            "type query · Enter run · Esc cancel".to_string()
+        } else if let Some(s) = last_search {
+            format!(
+                "/{} · n/N ({}/{}) · j/k move · Enter expand · y copy · e export · p pin · g/G · q back",
+                s.query,
+                if s.results.is_empty() { 0 } else { s.result_index + 1 },
+                s.results.len()
+            )
+        } else {
+            "j/k move · Enter expand · / search · y copy · e export · p pin · g/G top/bot · q back".to_string()
         };
         let status = Paragraph::new(Span::styled(
             format!(" [ptylenz] {}   blocks: {}", help, proxy.blocks().block_count()),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ));
-        f.render_widget(status, chunks[1]);
+        f.render_widget(status, status_area);
     })?;
     Ok(())
 }
 
-fn draw_list(
+fn draw_blocks(
     f: &mut ratatui::Frame,
     area: Rect,
     proxy: &PtyProxy,
@@ -659,52 +639,12 @@ fn draw_list(
         .blocks()
         .completed_blocks()
         .iter()
-        .chain(proxy.blocks().current_block().into_iter())
+        .chain(proxy.blocks().current_block())
         .collect();
 
     let items: Vec<ListItem> = all
         .iter()
-        .map(|b| {
-            let (tag, tag_style, row_style) = match &b.source {
-                BlockSource::Shell => {
-                    let s = match b.exit_code {
-                        Some(0) => Style::default().fg(Color::Green),
-                        Some(_) => Style::default().fg(Color::Red),
-                        None => Style::default().fg(Color::Yellow),
-                    };
-                    ("S", Style::default().fg(Color::DarkGray), s)
-                }
-                BlockSource::ClaudeTurn { role, .. } => {
-                    let role_style = if role == "user" {
-                        Style::default().fg(Color::Magenta)
-                    } else {
-                        Style::default().fg(Color::Cyan)
-                    };
-                    ("C", role_style, role_style)
-                }
-            };
-            let cmd = b.command.clone().unwrap_or_else(|| "(unknown)".to_string());
-            let status = match &b.source {
-                BlockSource::Shell => match b.exit_code {
-                    Some(0) => "ok".to_string(),
-                    Some(c) => format!("exit {c}"),
-                    None => "…".to_string(),
-                },
-                BlockSource::ClaudeTurn { role, .. } => role.clone(),
-            };
-            let text = format!(
-                " {:<3} {}  ·  {} lines  ·  {}  ·  {}",
-                format!("#{}", b.id),
-                b.started_at.format("%H:%M:%S"),
-                b.line_count(),
-                status,
-                cmd,
-            );
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("[{}] ", tag), tag_style),
-                Span::styled(text, row_style),
-            ]))
-        })
+        .map(|b| build_list_item(b))
         .collect();
 
     let block = RBlock::default()
@@ -725,131 +665,72 @@ fn draw_list(
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_detail(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    proxy: &PtyProxy,
-    selected: usize,
-    scroll: u16,
-) {
-    let block_ref = proxy.blocks().get_block_by_index(selected);
-    // For the currently-running block we prefer the live vt100 snapshot over
-    // `output_text()`: the raw buffer keeps every frame a TUI redraws, and
-    // strip_ansi only removes CSI — CR and cursor-overwrite bytes survive and
-    // render as stacked/overlapping lines in the Paragraph.
-    let is_current = block_ref
-        .map(|b| Some(b.id) == proxy.blocks().current_block().map(|c| c.id))
-        .unwrap_or(false);
-    let text = match block_ref {
-        Some(b) => {
-            if is_current {
-                if let Some(snap) = proxy.blocks().current_alt_snapshot() {
-                    snap.to_string()
-                } else {
-                    strip_bare_cr(&b.output_text())
-                }
-            } else {
-                b.output_text()
-            }
+fn build_list_item(b: &Block) -> ListItem<'static> {
+    let (tag, tag_style, row_style) = match &b.source {
+        BlockSource::Shell => {
+            let s = match b.exit_code {
+                Some(0) => Style::default().fg(Color::Green),
+                Some(_) => Style::default().fg(Color::Red),
+                None => Style::default().fg(Color::Yellow),
+            };
+            ("S", Style::default().fg(Color::DarkGray), s)
         }
-        None => "(no block)".to_string(),
+        BlockSource::ClaudeTurn { role, .. } => {
+            let role_style = if role == "user" {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            ("C", role_style, role_style)
+        }
     };
-    let title = match block_ref {
-        Some(b) => match &b.source {
-            BlockSource::Shell => format!(
-                " #{} · {} · {} ",
-                b.id,
-                b.command.as_deref().unwrap_or("(unknown)"),
-                match b.exit_code {
-                    Some(c) => format!("exit {c}"),
-                    None => "running".into(),
-                }
-            ),
-            BlockSource::ClaudeTurn {
-                role,
-                turn_index,
-                session_id,
-                ..
-            } => format!(
-                " #{} · [C] {} turn #{} · session {} ",
-                b.id,
-                role,
-                turn_index,
-                short_session(session_id),
-            ),
+    let cmd = b.command.clone().unwrap_or_else(|| "(unknown)".to_string());
+    let status = match &b.source {
+        BlockSource::Shell => match b.exit_code {
+            Some(0) => "ok".to_string(),
+            Some(c) => format!("exit {c}"),
+            None => "…".to_string(),
         },
-        None => " detail ".to_string(),
+        BlockSource::ClaudeTurn { role, .. } => role.clone(),
     };
-
-    let rblock = RBlock::default().borders(Borders::ALL).title(title);
-    let para = Paragraph::new(text)
-        .block(rblock)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    f.render_widget(para, area);
-}
-
-fn draw_search(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    _proxy: &PtyProxy,
-    query: &str,
-    results: &[(usize, usize, String)],
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(area);
-
-    let input = Paragraph::new(query).block(
-        RBlock::default()
-            .borders(Borders::ALL)
-            .title(" search (Enter to run, Esc to cancel) "),
+    let pin = if b.pinned { "📌" } else { "  " };
+    let fold = if b.collapsed { "▸" } else { "▾" };
+    let header = format!(
+        " {} {}{:<5} {}  ·  {} lines  ·  {}  ·  {}",
+        fold,
+        pin,
+        format!("#{}", b.id),
+        b.started_at.format("%H:%M:%S"),
+        b.line_count(),
+        status,
+        cmd,
     );
-    f.render_widget(input, chunks[0]);
 
-    let items: Vec<ListItem> = results
-        .iter()
-        .map(|(id, line, text)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("#{id} L{line}  "), Style::default().fg(Color::Cyan)),
-                Span::raw(trim_line(text, 200)),
-            ]))
-        })
-        .collect();
-    let list = List::new(items).block(
-        RBlock::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} matches ", results.len())),
-    );
-    f.render_widget(list, chunks[1]);
-}
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(format!("[{}] ", tag), tag_style),
+        Span::styled(header, row_style),
+    ])];
 
-/// Truncate a session uuid to its first 8 chars for the detail-view title.
-fn short_session(id: &str) -> String {
-    id.chars().take(8).collect()
-}
-
-/// Drop standalone CR (not part of a CRLF) so the Paragraph widget doesn't
-/// treat them as line continuations that overwrite earlier text — a common
-/// effect with progress bars / spinners captured in the raw buffer when no
-/// vt100 snapshot is available.
-fn strip_bare_cr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\r' {
-            if chars.peek() == Some(&'\n') {
-                out.push('\r');
-                out.push('\n');
-                chars.next();
+    if !b.collapsed {
+        let text = b.output_text();
+        let body_style = Style::default().fg(Color::Gray);
+        for (i, raw) in text.lines().enumerate() {
+            if i >= EXPAND_MAX_LINES {
+                let extra = text.lines().count().saturating_sub(EXPAND_MAX_LINES);
+                lines.push(Line::from(Span::styled(
+                    format!("      … ({} more lines — press e to export)", extra),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                break;
             }
-            // else: bare CR — drop
-        } else {
-            out.push(c);
+            lines.push(Line::from(Span::styled(
+                format!("      {}", trim_line(raw, 200)),
+                body_style,
+            )));
         }
     }
-    out
+
+    ListItem::new(lines)
 }
 
 fn trim_line(s: &str, max: usize) -> String {
@@ -922,7 +803,6 @@ fn terminal_size() -> Option<(u16, u16)> {
 
 fn copy_to_clipboard(text: &str) {
     let encoded = base64_encode(text.as_bytes());
-    // OSC 52: many terminals (incl. tmux with set-clipboard on) will accept.
     eprint!("\x1b]52;c;{}\x07", encoded);
 
     #[cfg(target_os = "linux")]
@@ -975,4 +855,3 @@ fn base64_encode(data: &[u8]) -> String {
     }
     result
 }
-
