@@ -1,4 +1,5 @@
 mod block;
+mod claude_feeder;
 mod pty;
 mod tui_app;
 

@@ -8,7 +8,7 @@
 ///! and index the output.
 
 use anyhow::{Context, Result};
-use nix::pty::{openpty, OpenptyResult};
+use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{self, ForkResult, Pid};
@@ -62,8 +62,13 @@ impl PtyProxy {
         // letting us inject the OSC 133 markers we need for block detection.
         let rcfile = write_bash_rcfile()?;
 
-        // Create PTY pair
-        let OpenptyResult { master, slave } = openpty(None, None)
+        // Create PTY pair with the real terminal's size baked in. Without this
+        // the kernel hands us 0×0 (or 80×24 on some platforms) and any child
+        // that reads LINES/COLUMNS before we SIGWINCH — ncurses apps like mc,
+        // which do exactly this during setupterm — draws at the wrong width
+        // and the real terminal wraps every line into a diagonal staircase.
+        let initial_ws = query_winsize();
+        let OpenptyResult { master, slave } = openpty(initial_ws.as_ref(), None)
             .context("Failed to open PTY pair")?;
 
         let block_engine = BlockEngine::new();
@@ -150,7 +155,7 @@ impl PtyProxy {
     }
 
     /// Resize the PTY (forward terminal resize to child).
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -160,6 +165,8 @@ impl PtyProxy {
         unsafe {
             libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
         }
+        // Keep the shadow vt100 parser's grid matched to the real terminal.
+        self.block_engine.resize(rows, cols);
         // Notify child of resize
         self.signal_child(Signal::SIGWINCH)?;
         Ok(())
@@ -179,6 +186,19 @@ impl PtyProxy {
 impl Drop for PtyProxy {
     fn drop(&mut self) {
         self.signal_child(Signal::SIGHUP).ok();
+    }
+}
+
+/// Read the current terminal's winsize from STDOUT so the PTY can be opened
+/// at the correct dimensions before fork. Returns None if STDOUT isn't a tty
+/// or the ioctl fails — caller falls back to openpty's kernel default.
+fn query_winsize() -> Option<Winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+        Some(ws)
+    } else {
+        None
     }
 }
 

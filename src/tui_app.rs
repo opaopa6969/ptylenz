@@ -40,13 +40,27 @@ use ratatui::{
 };
 use std::io::{self, Write};
 use std::os::fd::BorrowedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::block::Block;
+use crate::block::{Block, BlockSource};
+use crate::claude_feeder;
 use crate::pty::PtyProxy;
 
 const STDIN_KEY: usize = 0;
 const PTY_KEY: usize = 1;
+
+static RESIZED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sigwinch(_: libc::c_int) {
+    RESIZED.store(true, Ordering::Relaxed);
+}
+
+fn install_sigwinch_handler() {
+    unsafe {
+        libc::signal(libc::SIGWINCH, on_sigwinch as *const () as libc::sighandler_t);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum OverlayView {
@@ -83,6 +97,17 @@ impl App {
             proxy.resize(cols, rows).ok();
         }
 
+        install_sigwinch_handler();
+
+        // Start watching Claude Code's JSONL for the current cwd so that
+        // `claude` sessions launched from the inner shell become per-turn
+        // blocks instead of one opaque alt-screen dump. Silent-fail if the
+        // env gives us no HOME or the user never runs claude.
+        let claude_rx = match std::env::current_dir() {
+            Ok(cwd) => claude_feeder::spawn_watcher(&cwd),
+            Err(_) => std::sync::mpsc::channel().1,
+        };
+
         let saved_termios = set_raw_mode()?;
         let _term_guard = TermiosGuard(saved_termios);
 
@@ -111,6 +136,26 @@ impl App {
         loop {
             if !proxy.child_alive() {
                 break;
+            }
+
+            if RESIZED.swap(false, Ordering::Relaxed) {
+                if let Some((cols, rows)) = terminal_size() {
+                    proxy.resize(cols, rows).ok();
+                    if let Some(term) = overlay_term.as_mut() {
+                        term.autoresize().ok();
+                    }
+                }
+            }
+
+            // Drain any Claude turn events that arrived since the last tick.
+            // try_recv is non-blocking; Disconnected means the watcher thread
+            // exited (e.g. bad HOME) and we just stop listening.
+            loop {
+                match claude_rx.try_recv() {
+                    Ok(ev) => proxy.blocks_mut().ingest_claude_event(ev),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
             }
 
             events.clear();
@@ -318,7 +363,7 @@ fn handle_overlay_bytes(
                     *detail_scroll = 0;
                 }
                 Key::Char('y') => {
-                    if let Some(block) = proxy.blocks().get_block(*selected + 1) {
+                    if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
                         copy_to_clipboard(&block.output_text());
                     }
                 }
@@ -340,7 +385,7 @@ fn handle_overlay_bytes(
                     *detail_scroll = detail_scroll.saturating_sub(1);
                 }
                 Key::Char('y') => {
-                    if let Some(block) = proxy.blocks().get_block(*selected + 1) {
+                    if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
                         copy_to_clipboard(&block.output_text());
                     }
                 }
@@ -352,9 +397,13 @@ fn handle_overlay_bytes(
                 }
                 Key::Enter => {
                     *results = proxy.blocks().search(query);
-                    // Jump selection to first hit, if any.
+                    // Jump selection to first hit, if any. The search result
+                    // carries a block *id*, so translate it to the index the
+                    // list view is navigating by.
                     if let Some(first) = results.first() {
-                        *selected = first.0.saturating_sub(1);
+                        if let Some(idx) = proxy.blocks().index_of_block_id(first.0) {
+                            *selected = idx;
+                        }
                         *view = OverlayView::List;
                     }
                 }
@@ -509,26 +558,45 @@ fn draw_list(
     let items: Vec<ListItem> = all
         .iter()
         .map(|b| {
-            let style = match b.exit_code {
-                Some(0) => Style::default().fg(Color::Green),
-                Some(_) => Style::default().fg(Color::Red),
-                None => Style::default().fg(Color::Yellow),
+            let (tag, tag_style, row_style) = match &b.source {
+                BlockSource::Shell => {
+                    let s = match b.exit_code {
+                        Some(0) => Style::default().fg(Color::Green),
+                        Some(_) => Style::default().fg(Color::Red),
+                        None => Style::default().fg(Color::Yellow),
+                    };
+                    ("S", Style::default().fg(Color::DarkGray), s)
+                }
+                BlockSource::ClaudeTurn { role, .. } => {
+                    let role_style = if role == "user" {
+                        Style::default().fg(Color::Magenta)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    };
+                    ("C", role_style, role_style)
+                }
             };
             let cmd = b.command.clone().unwrap_or_else(|| "(unknown)".to_string());
-            let status = match b.exit_code {
-                Some(0) => "ok".to_string(),
-                Some(c) => format!("exit {c}"),
-                None => "…".to_string(),
+            let status = match &b.source {
+                BlockSource::Shell => match b.exit_code {
+                    Some(0) => "ok".to_string(),
+                    Some(c) => format!("exit {c}"),
+                    None => "…".to_string(),
+                },
+                BlockSource::ClaudeTurn { role, .. } => role.clone(),
             };
             let text = format!(
-                "#{:<3} {}  ·  {} lines  ·  {}  ·  {}",
-                b.id,
+                " {:<3} {}  ·  {} lines  ·  {}  ·  {}",
+                format!("#{}", b.id),
                 b.started_at.format("%H:%M:%S"),
                 b.line_count(),
                 status,
                 cmd,
             );
-            ListItem::new(Line::from(Span::styled(text, style)))
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("[{}] ", tag), tag_style),
+                Span::styled(text, row_style),
+            ]))
         })
         .collect();
 
@@ -557,21 +625,52 @@ fn draw_detail(
     selected: usize,
     scroll: u16,
 ) {
-    let block_ref = proxy.blocks().get_block(selected + 1);
+    let block_ref = proxy.blocks().get_block_by_index(selected);
+    // For the currently-running block we prefer the live vt100 snapshot over
+    // `output_text()`: the raw buffer keeps every frame a TUI redraws, and
+    // strip_ansi only removes CSI — CR and cursor-overwrite bytes survive and
+    // render as stacked/overlapping lines in the Paragraph.
+    let is_current = block_ref
+        .map(|b| Some(b.id) == proxy.blocks().current_block().map(|c| c.id))
+        .unwrap_or(false);
     let text = match block_ref {
-        Some(b) => b.output_text(),
+        Some(b) => {
+            if is_current {
+                if let Some(snap) = proxy.blocks().current_alt_snapshot() {
+                    snap.to_string()
+                } else {
+                    strip_bare_cr(&b.output_text())
+                }
+            } else {
+                b.output_text()
+            }
+        }
         None => "(no block)".to_string(),
     };
     let title = match block_ref {
-        Some(b) => format!(
-            " #{} · {} · {} ",
-            b.id,
-            b.command.as_deref().unwrap_or("(unknown)"),
-            match b.exit_code {
-                Some(c) => format!("exit {c}"),
-                None => "running".into(),
-            }
-        ),
+        Some(b) => match &b.source {
+            BlockSource::Shell => format!(
+                " #{} · {} · {} ",
+                b.id,
+                b.command.as_deref().unwrap_or("(unknown)"),
+                match b.exit_code {
+                    Some(c) => format!("exit {c}"),
+                    None => "running".into(),
+                }
+            ),
+            BlockSource::ClaudeTurn {
+                role,
+                turn_index,
+                session_id,
+                ..
+            } => format!(
+                " #{} · [C] {} turn #{} · session {} ",
+                b.id,
+                role,
+                turn_index,
+                short_session(session_id),
+            ),
+        },
         None => " detail ".to_string(),
     };
 
@@ -617,6 +716,33 @@ fn draw_search(
             .title(format!(" {} matches ", results.len())),
     );
     f.render_widget(list, chunks[1]);
+}
+
+/// Truncate a session uuid to its first 8 chars for the detail-view title.
+fn short_session(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Drop standalone CR (not part of a CRLF) so the Paragraph widget doesn't
+/// treat them as line continuations that overwrite earlier text — a common
+/// effect with progress bars / spinners captured in the raw buffer when no
+/// vt100 snapshot is available.
+fn strip_bare_cr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                out.push('\r');
+                out.push('\n');
+                chars.next();
+            }
+            // else: bare CR — drop
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn trim_line(s: &str, max: usize) -> String {
