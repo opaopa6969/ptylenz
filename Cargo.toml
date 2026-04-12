@@ -1,0 +1,27 @@
+[package]
+name = "ptylenz"
+version = "0.1.0"
+edition = "2021"
+description = "PTY proxy + TUI — structured output blocks for your terminal"
+license = "MIT"
+repository = "https://github.com/opaopa6969/ptylenz"
+keywords = ["terminal", "tui", "pty", "shell", "productivity"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# PTY
+rustix = { version = "0.38", features = ["termios", "process", "pipe"] }
+nix = { version = "0.29", features = ["pty", "signal", "process"] }
+
+# Utilities
+anyhow = "1"
+chrono = "0.4"
+regex = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
