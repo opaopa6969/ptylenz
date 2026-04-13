@@ -893,6 +893,39 @@ mod tests {
         assert_eq!(e, "line1\\n\\\"quoted\\\"\\tpath\\\\with\\\\slash");
     }
 
+    /// A long single-line command (longer than the terminal width) must come
+    /// out of `output_text()` as a single line — no synthetic newlines from
+    /// the terminal's display-time wrap. This is the central reason ptylenz
+    /// holds the raw PTY byte stream rather than the screen grid: tmux/mouse
+    /// copies of a wrapped curl invocation insert \n at the wrap column;
+    /// ours must not.
+    #[test]
+    fn long_line_copy_does_not_get_wrap_newlines() {
+        let mut engine = BlockEngine::new();
+        // Simulate a narrow 40-column terminal so the vt100 shadow grid would
+        // wrap a long line at column 40 if anything were sourcing copy from it.
+        engine.resize(24, 40);
+
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b]133;E;curl long\x07");
+
+        let payload: String = "x".repeat(400);
+        let mut bytes = payload.clone().into_bytes();
+        bytes.push(b'\n');
+        engine.feed_output(&bytes);
+
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        let block = &engine.completed_blocks()[0];
+        let text = block.output_text();
+
+        // Plain shell command (no alt-screen): the raw byte stream is the
+        // source of truth, so the long line stays on one line.
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "long line must not split: got {:?}", lines);
+        assert_eq!(lines[0].len(), 400);
+    }
+
     #[test]
     fn test_strip_ansi() {
         let input = "\x1b[32mgreen\x1b[0m plain \x1b[1;31mred\x1b[0m";
