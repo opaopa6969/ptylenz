@@ -690,7 +690,9 @@ fn render_turn(role: &str, text: &str, tool_uses: &[ToolUse]) -> String {
         out.push('\n');
     }
     for t in tool_uses {
-        out.push_str("  → ");
+        // Marker without leading spaces so a plain copy of the block doesn't
+        // bake whitespace into the start of (often script-shaped) tool input.
+        out.push_str("→ ");
         out.push_str(&t.name);
         out.push('(');
         // Truncate very large inputs so the block summary stays useful.

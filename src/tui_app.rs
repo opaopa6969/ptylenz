@@ -11,19 +11,30 @@
 ///! (0x1d). Pressing it enters Ptylenz mode; pressing it again (or q / Esc)
 ///! leaves.
 ///!
-///! Ptylenz-mode keys:
+///! Ptylenz · List view (default):
 ///!   j / ↓         next block
 ///!   k / ↑         previous block
-///!   g             jump to first block
-///!   G             jump to last block
+///!   g / G         jump to first / last block
 ///!   Enter         toggle expand/collapse of selected block
+///!   v             open Detail view of selected block
 ///!   /             search sub-mode
-///!   n             next search result
-///!   N             previous search result
-///!   y             copy selected block's output to clipboard
+///!   n / N         next / previous search result
+///!   y             copy whole selected block to clipboard
 ///!   e             export all blocks as JSON (current dir)
 ///!   p             toggle pin on selected block
 ///!   q / Esc / Ctrl+]   back to Normal
+///!
+///! Ptylenz · Detail view (one block, full-screen):
+///!   j/k/h/l       move cursor
+///!   g / G         top / bottom
+///!   0 / $         line start / end
+///!   Ctrl+u/d      page up / down
+///!   v             start/end linewise (line-range) selection
+///!   Ctrl+v        start/end blockwise (rectangular) selection
+///!   y             yank selection (or whole block if no selection)
+///!   Y             yank whole block (always)
+///!   Esc           clear selection, or back to list if none
+///!   q             back to list
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -82,11 +93,41 @@ struct SearchState {
     result_index: usize,
 }
 
+/// Selection style inside the Detail view.
+///
+/// `Linewise` selects every character on every line in `[anchor_row, cursor_row]`.
+/// `Blockwise` selects the rectangle bounded by anchor and cursor — the vim
+/// `Ctrl-v` model — handy for grabbing a single column out of `ls -l` or
+/// trimming the leading whitespace off a script.
+#[derive(Debug, Clone)]
+enum Selection {
+    None,
+    Linewise { anchor_row: usize },
+    Blockwise { anchor_row: usize, anchor_col: usize },
+}
+
+/// State for Detail view: full-screen view of one block with a movable
+/// cursor and optional selection.
+#[derive(Debug, Clone)]
+struct DetailState {
+    block_id: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+    selection: Selection,
+}
+
+#[derive(Debug, Clone)]
+enum PtylenzView {
+    List,
+    Detail(DetailState),
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     Normal,
     Ptylenz {
         selected: usize,
+        view: PtylenzView,
         /// Some while the user is typing a search query (`/` pressed).
         /// None otherwise — including after Enter, when we fall back to
         /// the block list with `last_search` populated for n/N.
@@ -288,6 +329,7 @@ fn enter_ptylenz(
 
     *mode = Mode::Ptylenz {
         selected,
+        view: PtylenzView::List,
         search_input: None,
         last_search: None,
     };
@@ -317,8 +359,14 @@ fn handle_ptylenz_bytes(
 ) -> Result<()> {
     let keys = decode_keys(bytes);
     for (code, ctrl) in keys {
+        // Ctrl+] always leaves Ptylenz mode, regardless of sub-state.
+        if ctrl && code == Key::Char(']') {
+            return leave_ptylenz(mode, ptylenz_term);
+        }
+
         let Mode::Ptylenz {
             selected,
+            view,
             search_input,
             last_search,
         } = mode
@@ -326,9 +374,15 @@ fn handle_ptylenz_bytes(
             return Ok(());
         };
 
-        // Ctrl+] always leaves Ptylenz mode, regardless of sub-state.
-        if ctrl && code == Key::Char(']') {
-            return leave_ptylenz(mode, ptylenz_term);
+        // Detail view captures everything; never falls back to list bindings.
+        if let PtylenzView::Detail(detail) = view {
+            match handle_detail_key(code, ctrl, detail, *selected, proxy) {
+                DetailOutcome::StayInDetail => {}
+                DetailOutcome::BackToList => {
+                    *view = PtylenzView::List;
+                }
+            }
+            continue;
         }
 
         if let Some(query) = search_input.as_mut() {
@@ -366,6 +420,16 @@ fn handle_ptylenz_bytes(
                 if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
                     let id = block.id;
                     proxy.blocks_mut().toggle_collapse(id);
+                }
+            }
+            Key::Char('v') => {
+                if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
+                    *view = PtylenzView::Detail(DetailState {
+                        block_id: block.id,
+                        cursor_row: 0,
+                        cursor_col: 0,
+                        selection: Selection::None,
+                    });
                 }
             }
             Key::Char('/') => {
@@ -409,6 +473,156 @@ fn handle_ptylenz_bytes(
     }
 
     Ok(())
+}
+
+enum DetailOutcome {
+    StayInDetail,
+    BackToList,
+}
+
+fn handle_detail_key(
+    code: Key,
+    ctrl: bool,
+    detail: &mut DetailState,
+    selected_index: usize,
+    proxy: &PtyProxy,
+) -> DetailOutcome {
+    // Resolve the block & line buffer once per key — cheap, and avoids holding
+    // a borrow across the cursor-mutation logic below.
+    let lines: Vec<String> = match proxy.blocks().get_block_by_index(selected_index) {
+        Some(b) => b.output_text().lines().map(|s| s.to_string()).collect(),
+        None => return DetailOutcome::BackToList,
+    };
+    let row_count = lines.len().max(1);
+    let line_len = |row: usize| -> usize {
+        lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
+    };
+
+    match (code, ctrl) {
+        (Key::Char('q'), false) => return DetailOutcome::BackToList,
+        (Key::Esc, false) => {
+            if !matches!(detail.selection, Selection::None) {
+                detail.selection = Selection::None;
+            } else {
+                return DetailOutcome::BackToList;
+            }
+        }
+        (Key::Char('j'), false) | (Key::Down, false) => {
+            if detail.cursor_row + 1 < row_count {
+                detail.cursor_row += 1;
+                detail.cursor_col = detail.cursor_col.min(line_len(detail.cursor_row));
+            }
+        }
+        (Key::Char('k'), false) | (Key::Up, false) => {
+            if detail.cursor_row > 0 {
+                detail.cursor_row -= 1;
+                detail.cursor_col = detail.cursor_col.min(line_len(detail.cursor_row));
+            }
+        }
+        (Key::Char('h'), false) | (Key::Left, false) => {
+            if detail.cursor_col > 0 {
+                detail.cursor_col -= 1;
+            }
+        }
+        (Key::Char('l'), false) | (Key::Right, false) => {
+            let max = line_len(detail.cursor_row);
+            if detail.cursor_col < max {
+                detail.cursor_col += 1;
+            }
+        }
+        (Key::Char('g'), false) => {
+            detail.cursor_row = 0;
+            detail.cursor_col = 0;
+        }
+        (Key::Char('G'), false) => {
+            detail.cursor_row = row_count - 1;
+            detail.cursor_col = detail.cursor_col.min(line_len(detail.cursor_row));
+        }
+        (Key::Char('0'), false) => {
+            detail.cursor_col = 0;
+        }
+        (Key::Char('$'), false) => {
+            detail.cursor_col = line_len(detail.cursor_row);
+        }
+        // Ctrl+u / Ctrl+d → page up / down. decode_keys turns 0x15/0x04 into
+        // ('u', true) / ('d', true).
+        (Key::Char('d'), true) => {
+            detail.cursor_row = (detail.cursor_row + 10).min(row_count - 1);
+            detail.cursor_col = detail.cursor_col.min(line_len(detail.cursor_row));
+        }
+        (Key::Char('u'), true) => {
+            detail.cursor_row = detail.cursor_row.saturating_sub(10);
+            detail.cursor_col = detail.cursor_col.min(line_len(detail.cursor_row));
+        }
+        // Visual-line mode: `v` toggles linewise selection anchored at the
+        // current cursor row.
+        (Key::Char('v'), false) => {
+            detail.selection = match detail.selection {
+                Selection::Linewise { .. } => Selection::None,
+                _ => Selection::Linewise { anchor_row: detail.cursor_row },
+            };
+        }
+        // Visual-block mode: Ctrl+v toggles blockwise selection anchored at
+        // the current cursor cell.
+        (Key::Char('v'), true) => {
+            detail.selection = match detail.selection {
+                Selection::Blockwise { .. } => Selection::None,
+                _ => Selection::Blockwise {
+                    anchor_row: detail.cursor_row,
+                    anchor_col: detail.cursor_col,
+                },
+            };
+        }
+        // y: yank selection (or whole block if no selection).
+        (Key::Char('y'), false) => {
+            let text = match &detail.selection {
+                Selection::None => lines.join("\n"),
+                Selection::Linewise { anchor_row } => {
+                    let (lo, hi) = sort_pair(*anchor_row, detail.cursor_row);
+                    let hi = hi.min(row_count - 1);
+                    lines[lo..=hi].join("\n")
+                }
+                Selection::Blockwise { anchor_row, anchor_col } => {
+                    let (rlo, rhi) = sort_pair(*anchor_row, detail.cursor_row);
+                    let (clo, chi) = sort_pair(*anchor_col, detail.cursor_col);
+                    let rhi = rhi.min(row_count - 1);
+                    let mut out = String::new();
+                    for r in rlo..=rhi {
+                        let line = lines.get(r).map(String::as_str).unwrap_or("");
+                        let chars: Vec<char> = line.chars().collect();
+                        let segment_lo = clo.min(chars.len());
+                        let segment_hi = (chi + 1).min(chars.len());
+                        let segment: String = chars[segment_lo..segment_hi].iter().collect();
+                        if r > rlo {
+                            out.push('\n');
+                        }
+                        out.push_str(&segment);
+                    }
+                    out
+                }
+            };
+            copy_to_clipboard(&text);
+            eprint!(
+                "\r\n[ptylenz] copied {} chars from block #{}\r\n",
+                text.chars().count(),
+                detail.block_id
+            );
+            detail.selection = Selection::None;
+        }
+        // Y: always yank the whole block (vim's Y semantic, adapted).
+        (Key::Char('Y'), false) => {
+            let text = lines.join("\n");
+            copy_to_clipboard(&text);
+            eprint!("\r\n[ptylenz] copied block #{}\r\n", detail.block_id);
+        }
+        _ => {}
+    }
+
+    DetailOutcome::StayInDetail
+}
+
+fn sort_pair(a: usize, b: usize) -> (usize, usize) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 enum SearchInputOutcome {
@@ -563,6 +777,7 @@ fn draw_ptylenz(
 ) -> Result<()> {
     let Mode::Ptylenz {
         selected,
+        view,
         search_input,
         last_search,
     } = mode
@@ -572,59 +787,75 @@ fn draw_ptylenz(
 
     term.draw(|f| {
         let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
 
-        // Optionally reserve a 3-row strip at the top for the search input.
-        let (list_area, search_bar) = if search_input.is_some() {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
-            (chunks[1], Some((chunks[0], chunks[2])))
-        } else {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area);
-            (chunks[0], None)
-        };
+        match view {
+            PtylenzView::List => {
+                // List view may also show a search input bar on top of the list.
+                let (list_area, search_bar_area) = if search_input.is_some() {
+                    let inner = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(3), Constraint::Min(1)])
+                        .split(chunks[0]);
+                    (inner[1], Some(inner[0]))
+                } else {
+                    (chunks[0], None)
+                };
 
-        if let Some((bar_area, _)) = search_bar {
-            let q = search_input.as_deref().unwrap_or("");
-            let input = Paragraph::new(q).block(
-                RBlock::default()
-                    .borders(Borders::ALL)
-                    .title(" / search — Enter run, Esc cancel "),
-            );
-            f.render_widget(input, bar_area);
+                if let Some(bar) = search_bar_area {
+                    let q = search_input.as_deref().unwrap_or("");
+                    let input = Paragraph::new(q).block(
+                        RBlock::default()
+                            .borders(Borders::ALL)
+                            .title(" / search — Enter run, Esc cancel "),
+                    );
+                    f.render_widget(input, bar);
+                }
+
+                draw_blocks(f, list_area, proxy, *selected);
+            }
+            PtylenzView::Detail(detail) => {
+                draw_detail(f, chunks[0], proxy, detail);
+            }
         }
 
-        draw_blocks(f, list_area, proxy, *selected);
-
-        let status_area = match search_bar {
-            Some((_, s)) => s,
-            None => Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(area)[1],
-        };
-
-        let help = if search_input.is_some() {
-            "type query · Enter run · Esc cancel".to_string()
-        } else if let Some(s) = last_search {
-            format!(
-                "/{} · n/N ({}/{}) · j/k move · Enter expand · y copy · e export · p pin · g/G · q back",
-                s.query,
-                if s.results.is_empty() { 0 } else { s.result_index + 1 },
-                s.results.len()
-            )
-        } else {
-            "j/k move · Enter expand · / search · y copy · e export · p pin · g/G top/bot · q back".to_string()
+        let help = match view {
+            PtylenzView::Detail(d) => {
+                let sel = match &d.selection {
+                    Selection::None => "no selection".to_string(),
+                    Selection::Linewise { .. } => "VISUAL LINE".to_string(),
+                    Selection::Blockwise { .. } => "VISUAL BLOCK".to_string(),
+                };
+                format!(
+                    "{} · h/j/k/l move · g/G · v line · ^v block · y yank · Y all · q back · row {}/col {}",
+                    sel,
+                    d.cursor_row + 1,
+                    d.cursor_col + 1,
+                )
+            }
+            PtylenzView::List => {
+                if search_input.is_some() {
+                    "type query · Enter run · Esc cancel".to_string()
+                } else if let Some(s) = last_search {
+                    format!(
+                        "/{} · n/N ({}/{}) · j/k · Enter fold · v detail · y copy · e export · p pin · q back",
+                        s.query,
+                        if s.results.is_empty() { 0 } else { s.result_index + 1 },
+                        s.results.len()
+                    )
+                } else {
+                    "j/k move · Enter fold · v detail · / search · y copy · e export · p pin · g/G · q back".to_string()
+                }
+            }
         };
         let status = Paragraph::new(Span::styled(
             format!(" [ptylenz] {}   blocks: {}", help, proxy.blocks().block_count()),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ));
-        f.render_widget(status, status_area);
+        f.render_widget(status, chunks[1]);
     })?;
     Ok(())
 }
@@ -663,6 +894,123 @@ fn draw_blocks(
         state.select(Some(selected.min(all.len().saturating_sub(1))));
     }
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Render the Detail view: one block, full body, with cursor and optional
+/// linewise / blockwise highlight. Auto-scrolls so the cursor stays in view.
+fn draw_detail(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    proxy: &PtyProxy,
+    detail: &DetailState,
+) {
+    let block_ref = proxy.blocks().get_block(detail.block_id);
+    let (title, lines): (String, Vec<String>) = match block_ref {
+        Some(b) => (
+            format!(
+                " #{} · {} · {} · {} lines ",
+                b.id,
+                b.command.as_deref().unwrap_or("(unknown)"),
+                match b.exit_code {
+                    Some(c) => format!("exit {c}"),
+                    None => "running".into(),
+                },
+                b.line_count(),
+            ),
+            b.output_text().lines().map(|s| s.to_string()).collect(),
+        ),
+        None => (" detail ".into(), vec!["(block not found)".into()]),
+    };
+
+    let rblock = RBlock::default().borders(Borders::ALL).title(title);
+    let inner = rblock.inner(area);
+
+    // Compute viewport scroll so the cursor row is visible.
+    let viewport_h = inner.height as usize;
+    let scroll_top = if viewport_h == 0 {
+        0usize
+    } else if detail.cursor_row < viewport_h {
+        0
+    } else {
+        detail.cursor_row + 1 - viewport_h
+    };
+    let scroll_top = scroll_top.min(lines.len().saturating_sub(viewport_h.max(1)));
+
+    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+    let select_style = Style::default()
+        .bg(Color::Blue)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let mut rendered: Vec<Line> = Vec::with_capacity(viewport_h);
+    let visible_end = (scroll_top + viewport_h).min(lines.len());
+
+    for row in scroll_top..visible_end {
+        let line_str = &lines[row];
+        let chars: Vec<char> = line_str.chars().collect();
+
+        let (sel_lo, sel_hi) = selection_range_for_row(&detail.selection, detail, row, chars.len());
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let cursor_in_this_row = row == detail.cursor_row;
+
+        // Walk every column position [0..max(chars.len, cursor_col+1)] so we
+        // can paint the cursor even when it sits past end-of-line.
+        let max_col = chars.len().max(if cursor_in_this_row { detail.cursor_col + 1 } else { 0 });
+        let mut col = 0;
+        while col < max_col {
+            let ch = chars.get(col).copied().unwrap_or(' ');
+
+            let in_selection = sel_lo.map_or(false, |lo| col >= lo && col < sel_hi.unwrap_or(0));
+            let is_cursor = cursor_in_this_row && col == detail.cursor_col;
+
+            let style = if is_cursor {
+                cursor_style
+            } else if in_selection {
+                select_style
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+            col += 1;
+        }
+        if spans.is_empty() {
+            spans.push(Span::raw(""));
+        }
+        rendered.push(Line::from(spans));
+    }
+
+    let para = Paragraph::new(rendered).block(rblock);
+    f.render_widget(para, area);
+}
+
+/// Compute (start, end_exclusive) selection columns for `row`. Returns
+/// (None, None) when the row is outside the selection.
+fn selection_range_for_row(
+    sel: &Selection,
+    detail: &DetailState,
+    row: usize,
+    line_chars: usize,
+) -> (Option<usize>, Option<usize>) {
+    match sel {
+        Selection::None => (None, None),
+        Selection::Linewise { anchor_row } => {
+            let (lo, hi) = sort_pair(*anchor_row, detail.cursor_row);
+            if row >= lo && row <= hi {
+                (Some(0), Some(line_chars))
+            } else {
+                (None, None)
+            }
+        }
+        Selection::Blockwise { anchor_row, anchor_col } => {
+            let (rlo, rhi) = sort_pair(*anchor_row, detail.cursor_row);
+            if row < rlo || row > rhi {
+                return (None, None);
+            }
+            let (clo, chi) = sort_pair(*anchor_col, detail.cursor_col);
+            (Some(clo), Some((chi + 1).min(line_chars)))
+        }
+    }
 }
 
 fn build_list_item(b: &Block) -> ListItem<'static> {
@@ -854,4 +1202,68 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detail_at(row: usize, col: usize, sel: Selection) -> DetailState {
+        DetailState {
+            block_id: 1,
+            cursor_row: row,
+            cursor_col: col,
+            selection: sel,
+        }
+    }
+
+    #[test]
+    fn linewise_range_covers_whole_lines_in_anchor_to_cursor_span() {
+        let d = detail_at(3, 5, Selection::Linewise { anchor_row: 1 });
+        // Row inside the span — full line selected.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 2, 10),
+            (Some(0), Some(10))
+        );
+        // Row outside — no selection.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 4, 10),
+            (None, None)
+        );
+        // Anchor row itself — included.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 1, 7),
+            (Some(0), Some(7))
+        );
+    }
+
+    #[test]
+    fn blockwise_range_clamps_to_line_length() {
+        let d = detail_at(2, 8, Selection::Blockwise { anchor_row: 0, anchor_col: 3 });
+        // Long line: full block columns visible.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 1, 20),
+            (Some(3), Some(9))
+        );
+        // Short line: clamped to its end.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 1, 5),
+            (Some(3), Some(5))
+        );
+        // Outside row range — nothing.
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 3, 20),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn blockwise_range_handles_reversed_anchor() {
+        // Cursor sits above-and-left of the anchor — the range is sorted.
+        let d = detail_at(0, 2, Selection::Blockwise { anchor_row: 4, anchor_col: 7 });
+        assert_eq!(
+            selection_range_for_row(&d.selection, &d, 2, 20),
+            (Some(2), Some(8))
+        );
+    }
 }
