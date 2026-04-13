@@ -148,6 +148,20 @@ The `e` export uses the [claude-session-replay](https://github.com/opaopa6969/cl
 
 Same family, same philosophy: take a raw OS text interface and make it navigable.
 
+## Tips: auto-enter ptylenz on shell startup (optional, advanced)
+
+Add this to the end of `~/.bashrc` and every new terminal opens straight into ptylenz:
+
+```bash
+# Skip in non-interactive shells (scp / rsync / ssh host cmd, etc.)
+case $- in *i*) ;; *) return ;; esac
+[ -z "$PTYLENZ" ] && command -v ptylenz >/dev/null && exec ptylenz
+```
+
+`$PTYLENZ` is set by ptylenz inside the child bash, preventing recursive launch. The `$-` interactive check is essential — without it, non-interactive sessions like `scp`, `rsync`, or `ssh host 'cmd'` will read bashrc, exec ptylenz, and break the transfer protocol.
+
+If ptylenz crashes, every new shell will also fail — so wait until you've used it long enough to trust it before enabling. Recovery: `bash --norc`.
+
 ## Documentation
 
 - [PROJECT.md](PROJECT.md) — architecture, design decisions, implementation notes
