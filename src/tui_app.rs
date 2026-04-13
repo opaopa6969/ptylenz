@@ -1142,7 +1142,7 @@ impl Drop for TermiosGuard {
 fn terminal_size() -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     unsafe {
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut ws) == 0 {
             return Some((ws.ws_col, ws.ws_row));
         }
     }

@@ -23,8 +23,10 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
             asset: ptylenz-macos-aarch64
+          # macOS x86_64 cross-compiled from the same arm64 runner; Apple
+          # ships a universal toolchain so this just works.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
             asset: ptylenz-macos-x86_64
 
     steps:

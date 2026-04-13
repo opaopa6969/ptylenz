@@ -79,7 +79,9 @@ impl PtyProxy {
                 unistd::setsid().ok();
 
                 unsafe {
-                    libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0);
+                    // libc::TIOCSCTTY is c_ulong on Linux but c_uint on macOS;
+                    // cast to the ioctl request type to compile on both.
+                    libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
                 }
 
                 unistd::dup2(slave.as_raw_fd(), 0).ok();
@@ -163,7 +165,7 @@ impl PtyProxy {
             ws_ypixel: 0,
         };
         unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
+            libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &winsize);
         }
         // Keep the shadow vt100 parser's grid matched to the real terminal.
         self.block_engine.resize(rows, cols);
@@ -194,7 +196,7 @@ impl Drop for PtyProxy {
 /// or the ioctl fails — caller falls back to openpty's kernel default.
 fn query_winsize() -> Option<Winsize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut ws) };
     if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
         Some(ws)
     } else {
