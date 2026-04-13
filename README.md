@@ -1,5 +1,7 @@
 # ptylenz
 
+> English · [日本語](README.ja.md)
+
 > **Wireshark for your PTY** — structured output blocks for the terminal.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -145,6 +147,11 @@ The `e` export uses the [claude-session-replay](https://github.com/opaopa6969/cl
 | **Tech** | Rust + ratatui | Rust + ratatui |
 
 Same family, same philosophy: take a raw OS text interface and make it navigable.
+
+## Documentation
+
+- [PROJECT.md](PROJECT.md) — architecture, design decisions, implementation notes
+- [DESIGN.md](DESIGN.md) — the rationale that led to ptylenz
 
 ## License
 

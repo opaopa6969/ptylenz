@@ -1,209 +1,243 @@
 # ptylenz — PROJECT.md
 
-> Claude Code handoff document. Contains design decisions, architecture rationale, and implementation roadmap.
+> English · [日本語](PROJECT.ja.md)
+
+> Handoff document: architecture, design decisions, and implementation notes.
 
 ## One-liner
 
-**syslenz が `/proc` の体験を変えたように、ptylenz は PTY の体験を変える。**
+**As `syslenz` changes the experience of `/proc`, `ptylenz` changes the experience of the PTY.**
 
-PTY プロキシ + TUI。コマンド出力をブロック単位で構造化し、検索・折りたたみ・コピーを可能にする。ターミナルの中で動くターミナル。
+A PTY proxy plus a TUI. Command output becomes structured blocks you can search, fold, and copy. A terminal that runs inside your terminal.
 
-## Problem Statement
+## The problem
 
-### 痛みの優先順位（ユーザーインタビューより）
+### Pain ranking
 
-1. **出力が流れて消える（スクロール地獄）** — Claude Code が 2000 行出力すると、先頭が見えない
-2. **テキスト選択・コピーが辛い** — tmux の選択モードは地獄
-3. **「さっきのあれ」を探せない** — スクロールバックの目 grep は 1978 年の VT100 と変わらない
-4. **複数セッションの管理** — 後回し（tmux が一応動く）
+1. **Output scrolls past and disappears.** When Claude Code prints 2,000 lines, the top is gone.
+2. **Selecting and copying is awful.** tmux / mouse-select bake `\n` into the wrap column.
+3. **You can't find "that thing earlier".** Eyeball-grepping scrollback is 1978 VT100 UX.
 
-### 根本原因
+### Root cause
 
-1-3 は全て同じ原因：**PTY ストリームが構造を持たない**。
+All three traceto the same fact: **the PTY stream has no structure**.
 
-バイトが流れて、バイトが消える。コマンドの境界も、出力の長さも、成功/失敗も、PTY レベルでは全て不可視。
+Bytes flow, bytes vanish. Command boundaries, output length, success/failure — none of it is visible at the PTY layer.
 
 ## Architecture
 
-### なぜシェルではなく PTY プロキシか
+### Why a PTY proxy and not a shell
 
-shell がプロセスを fork/exec した後、**shell はデータパスに存在しない**：
+After the shell `fork/exec`s a child, **the shell is no longer in the data path**:
 
 ```
-子プロセス (claude-code)
-  stdout → PTY slave → PTY master → ターミナルエミュレータ
+child process (claude-code)
+  stdout → PTY slave → PTY master → terminal emulator
 
-bash は wait() しているだけ。出力を一切見ていない。
+bash is just sitting in wait(); it never sees the output.
 ```
 
-したがって、出力を構造化するには PTY の master 側に座る必要がある。
-これは tmux と同じレイヤー（PTY multiplexer）だが、目的が異なる：
-- tmux: 画面分割 + セッション永続化
-- ptylenz: 出力のブロック化 + 検索 + コピー
+So to give output structure, we have to sit on the master side of the PTY. That's the same layer as `tmux` (a PTY multiplexer), but with a different purpose:
 
-### データフロー
+- tmux: panes + session persistence
+- ptylenz: output blocking + search + copy
+
+### Data flow
 
 ```
 ┌──────────────────────────────────────────────┐
-│ ptylenz プロセス                              │
+│ ptylenz process                              │
 │                                              │
-│  Terminal ←→ [PTY proxy] ←→ [PTY] ←→ bash   │
+│  Terminal ←→ [PTY proxy] ←→ [PTY] ←→ bash    │
 │                  ↓                     ↓     │
-│            [Block Engine]         fork/exec   │
+│            [Block Engine]         fork/exec  │
 │                  ↓                     ↓     │
-│            [TUI Renderer]        claude-code  │
+│            [TUI Renderer]         commands   │
 │                                              │
+│        [Claude JSONL feeder] ────────┐       │
+│              ↓                       ↓       │
+│        [Block Engine] ←──── claude turns     │
 └──────────────────────────────────────────────┘
 ```
 
-PTY proxy が全 I/O を中継する。bash がコマンドの前後に OSC マーカーを吐き、
-ptylenz がそれを検出して「ここからここまでが 1 コマンドの出力」と認識する。
+The PTY proxy relays all I/O. Bash emits OSC markers around each command, and ptylenz uses those to slice the byte stream into blocks. In parallel a feeder thread tails Claude Code's session JSONL log and ingests user/assistant turns as sibling blocks.
 
-### ブロック検出: OSC 133 プロトコル
+### Block detection: OSC 133
 
-iTerm2/Warp/VS Code Terminal 互換の OSC 133 シーケンスを使用：
+iTerm2 / Warp / VS Code Terminal–compatible OSC 133 sequences:
 
 | Sequence | Meaning |
 |----------|---------|
-| `\e]133;A\a` | Prompt start (新しいプロンプト表示) |
-| `\e]133;C\a` | Command execution start |
-| `\e]133;E;cmd\a` | Command text (ブロックのタイトル用) |
-| `\e]133;D;N\a` | Command finished, exit code = N |
+| `\e]133;A\a` | prompt start |
+| `\e]133;C\a` | command execution start |
+| `\e]133;D;N\a` | command finished, exit code = N |
+| `\e]133;E;cmd\a` | command text (block title) |
 
-bash の `PROMPT_COMMAND` と `DEBUG` trap を使って自動注入する。
+The bash integration emits these via `PROMPT_COMMAND` + `PS0` + `PS1`. We deliberately avoid the `DEBUG` trap because it nests inside any function that calls subcommands.
 
-### フォールバック（シェルインテグレーション無し）
+### Two modes, one prefix
 
-SSH 先など、インテグレーションを仕込めない環境では、
-プロンプトパターンの正規表現マッチで「おおよそ」のブロック境界を検出する。
-精度は落ちるが、無いよりはるかに良い。
+The whole UI follows a single rule: **Normal mode is invisible**. `Ctrl+]` is the one and only boundary key.
 
-## Key Design Decisions
+```
+Normal mode: every keystroke goes straight to bash
+                ↓ Ctrl+]
+Ptylenz mode: ratatui overlay
+              ├─ List view: blocks
+              └─ Detail view: one block, full screen, cursor + vim-style visual
+```
 
-### D1: bash を内側に抱える
+### Wrap-free copy
 
-ptylenz は bash を置き換えない。bash を PTY の中で動かし、その I/O を中継する。
-- 既存の `.bashrc`, 補完, エイリアス, 全て動く
-- ユーザーの学習コストがゼロ
-- バイナリ 1 つをコピーするだけでどのマシンでも使える
+`block.output` is the raw PTY byte stream. `output_text()` strips ANSI but never consults the screen width — so a long `curl` invocation wrapped onto three visual lines in an 80-column terminal still copies as the original one-liner. tmux / mouse-select copy from the screen grid, so they bake the wrap in; ptylenz copies from the source.
 
-### D2: ゼロコンフィグで 80 点
+### Alt-screen support (vt100 shadow)
 
-syslenz の「21 seconds to first insight」と同じ思想。
-起動したらデフォルトで全機能が動く。設定ファイルは一切不要。
+For TUI applications that take over the screen (`vim`, `less`, `claude`), we tee the same bytes into a parallel vt100 parser and snapshot the grid at command end into `rendered_text`. The block stays readable even after the TUI exits the alternate screen and wipes the live view.
 
-### D3: TUI は ratatui（syslenz と共通基盤）
+### Claude Code session integration
 
-syslenz で使っている ratatui をそのまま使用。
-将来的にウィジェットライブラリを共有する可能性がある。
+A background thread polls `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`, decodes user/assistant turns, and ingests them into the block engine as `BlockSource::ClaudeTurn` blocks. Shell commands and Claude turns interleave chronologically in the same list.
 
-### D4: LSP/DAP は外部プロセス（将来）
+## Design decisions
 
-シェルの入力補完（LSP）やスクリプトデバッグ（DAP）を足す場合、
-ptylenz 本体に組み込むのではなく、別プロセスとして動かす。
-ptylenz の TUI がクライアントとなり、JSON-RPC で通信する。
+### D1: keep bash inside
 
-これは「お作法」として正しい設計：
-- クラッシュが伝播しない
-- VS Code / Neovim からも同じ LSP/DAP を使える
-- ptylenz 本体が軽い
+ptylenz doesn't replace bash. It runs bash in a PTY and relays the I/O.
 
-## MVP Scope
+- existing `~/.bashrc`, completions, aliases all work
+- learning cost is zero
+- single binary; copy it, run it, anywhere
 
-### In（作る）
+### D2: zero config, 80% out of the box
 
-- [x] PTY proxy (fork/exec bash inside PTY, relay all I/O)
-- [ ] OSC 133 parser (detect block boundaries)
-- [ ] Block engine (segment output, index, store)
-- [ ] Block display (collapsed/expanded view)
-- [ ] Block navigation (Ctrl+↑/↓ to jump between blocks)
-- [ ] Full-text search across all blocks (Ctrl+F)
-- [ ] Block copy to clipboard (Ctrl+Y)
-- [ ] JSON export of session (Ctrl+E)
-- [ ] Auto-collapse long output (>50 lines)
-- [ ] Terminal resize forwarding (SIGWINCH)
+Same philosophy as syslenz's "21 seconds to first insight". No config file at all.
 
-### Out（作らない、今は）
+### D3: ratatui (shared with syslenz)
 
-- シェル文法の変更・パーサー（UBNF 等）
-- パイプラインの構造化データ（nushell 的）
-- プラグインシステム
-- セッション永続化（tmux が担当）
-- syslenz 統合パネル
-- AI 出力の意味解析
-- ブロックの diff 表示
-- リモートセッション管理
+We use the same TUI substrate so the two projects can share widgets later.
 
-## Crate Structure
+### D4: claude-session-replay-compatible JSON
+
+`e` exports the session in the [claude-session-replay](https://github.com/opaopa6969/claude-session-replay) common log model, so the same JSON is consumable by that project's HTML / terminal / MP4 renderers.
+
+### D5: LSP / DAP as external processes (future)
+
+When we add shell completion (LSP) or script debugging (DAP), they should run as separate processes. ptylenz's TUI becomes a JSON-RPC client. Crashes don't propagate, and VS Code / Neovim can use the same servers.
+
+## MVP scope
+
+### Done
+
+- [x] PTY proxy (fork/exec bash, I/O relay, SIGWINCH forwarding)
+- [x] OSC 133 parser (BEL and ESC-\\ terminators)
+- [x] Block engine (segment, search, JSON export)
+- [x] ratatui overlay (List view / Detail view)
+- [x] Block navigation (j/k, g/G, n/N, `/` search)
+- [x] Cross-block full-text search
+- [x] Clipboard via OSC 52 + xclip / pbcopy
+- [x] claude-session-replay-compatible JSON export
+- [x] Auto-collapse for long output (>50 lines)
+- [x] vt100 shadow grid for alt-screen TUI capture
+- [x] Claude Code JSONL session integration
+- [x] Detail view with linewise + blockwise (rectangular) selection
+- [x] Wrap-free copy (raw PTY byte stream)
+- [x] Linux x86_64 / macOS arm64 / macOS x86_64 release binaries
+
+### Future
+
+- Shell input completion via LSP (separate process)
+- Script debugger via DAP (separate process)
+- syslenz panel integration
+- Block-to-block diff
+- Session persistence (replace tmux for that purpose)
+
+## Crate layout
 
 ```
 ptylenz/
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs          # Entry point, CLI args
-│   ├── pty.rs           # PTY proxy: fork, relay, resize
-│   ├── block.rs         # Block engine: OSC parse, segment, search
-│   └── tui_app.rs       # TUI: event loop, render, keybindings
-├── PROJECT.md           # This file
-├── DESIGN.md            # Conversation-derived design rationale
-└── README.md
+│   ├── main.rs            # entry point
+│   ├── pty.rs             # PTY proxy: fork, relay, resize
+│   ├── block.rs           # block engine: OSC parse, segment, search, vt100 shadow
+│   ├── tui_app.rs         # TUI: event loop, ratatui rendering, keybindings
+│   └── claude_feeder.rs   # tail JSONL under ~/.claude/projects/
+├── .github/workflows/
+│   └── release.yml        # build release binaries on tag push
+├── PROJECT.md / PROJECT.ja.md
+├── DESIGN.md / DESIGN.ja.md
+└── README.md / README.ja.md
 ```
 
-## Implementation Notes
+## Implementation notes
 
-### PTY Proxy の核心コード
+### PTY proxy essentials
 
-`nix::pty::openpty()` で PTY ペアを作り、子プロセスで slave 側に接続、
-親プロセスで master 側を保持して全 I/O を中継する。
+- `nix::pty::openpty()` with the initial winsize baked in (critical: 0×0 makes ncurses apps draw at width 0 and the screen turns into a staircase)
+- child: `setsid()` → `TIOCSCTTY` → `dup2()` for stdin/stdout/stderr → slave
+- parent: hold the master fd and relay I/O
+- resize: `TIOCSWINSZ` plus `SIGWINCH` to the child
 
-重要なポイント：
-- `setsid()` で新しいセッションリーダーにする
-- `TIOCSCTTY` で PTY を制御端末にする
-- `dup2()` で stdin/stdout/stderr を slave にリダイレクト
-- `TIOCSWINSZ` + `SIGWINCH` でリサイズを転送
+### Event loop multiplexing
 
-### OSC パーサーのステートマシン
+Use the `polling` crate to watch stdin and the PTY master fd, level-triggered. We don't go through crossterm's event loop — raw bytes are decoded inline (`decode_keys`). Switching to and from the alternate screen is `crossterm::execute!`.
+
+### Bash integration injection
+
+A wrapper rcfile is written to `$TMPDIR` and passed via `--rcfile`:
+
+```bash
+[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
+PS0='\[\e]133;C\a\]'
+PS1='\[\e]133;A\a\]'"$PS1"
+PROMPT_COMMAND='__ptylenz_precmd'
+```
+
+`PROMPT_COMMAND` emits 133;D (exit code) and 133;E (the prior command, recovered from `history 1`).
+
+### OSC parser state machine
 
 ```
 Normal → ESC(\x1b) → Escape
 Escape → ']' → OscStart → OscBody
 OscBody → BEL(\x07) → [decode] → Normal
-OscBody → ESC(\x1b) → [decode] → Normal (ST terminator)
+OscBody → ESC \\ (ST) → [decode] → Normal
 Escape → other → emit(ESC + byte) → Normal
 ```
 
-OSC 133 以外のエスケープシーケンス（色、カーソル移動等）は
-そのまま通過させる（strip しない）。
+Non-OSC escapes (colors, cursor moves) pass through untouched.
 
-### クリップボード
+### Clipboard
 
-OSC 52 を第一候補（tmux 内でも動く）。
-フォールバックとして xclip (Linux) / pbcopy (macOS)。
+OSC 52 first (works inside tmux when `set-clipboard` is enabled). Fall back to xclip on Linux, pbcopy on macOS.
 
-## Relationship to Other Projects
+## Testing strategy
+
+1. **Unit tests**: OSC parser, block engine (boundaries, search, export), selection math.
+2. **Integration test**: spawn a real bash under the proxy, drive a few commands, assert the captured blocks.
+3. **Regression**: a 400-character line into a 40-column engine must come back as a single line — proves the wrap-free copy contract.
+
+## Related projects
 
 | Project | Relationship |
-|---------|-------------|
-| syslenz | 兄弟プロジェクト。ratatui 基盤共有。`/proc` → 構造化 の思想を PTY に適用 |
-| tmux | 同じレイヤー（PTY multiplexer）。将来的に tmux の中で動くか、置き換えるか |
-| Warp | 同じアイデア（block-based output）を GUI ではなく TUI で実現 |
-| bash | ptylenz が内包する。置き換えない |
-| unlaxer/UBNF | 将来的にシェル入力補完の文法定義に使う可能性 |
+|---------|--------------|
+| [syslenz](https://github.com/opaopa6969/syslenz) | sibling — shared ratatui base; `/proc` → structure transposed onto the PTY |
+| [claude-session-replay](https://github.com/opaopa6969/claude-session-replay) | the export target — shared common log model |
+| tmux | same layer (PTY multiplexer); different purpose (panes vs. structure) |
+| Warp | same idea (block-based output) in a GUI — we do it in the TUI |
+| bash | wrapped, never replaced |
 
-## Testing Strategy
-
-1. **Unit tests**: OSC parser, block engine (境界検出, 検索, エクスポート)
-2. **Integration tests**: PTY proxy の起動/終了, I/O リレーの正確性
-3. **Manual smoke test**: `ptylenz` 起動 → `ls`, `echo`, `cat` → ブロック確認
-
-## Build & Run
+## Build & run
 
 ```bash
 cargo build
 cargo test
 cargo run
 
-# Or install
+# install
 cargo install --path .
 ptylenz
 ```
+
+Pre-built binaries are on the [Releases page](https://github.com/opaopa6969/ptylenz/releases).

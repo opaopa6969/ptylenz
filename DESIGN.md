@@ -1,126 +1,123 @@
 # ptylenz — Design Rationale
 
-> この文書は、ptylenz の設計に至るまでの思考プロセスを記録したもの。
-> Claude Chat での設計セッション（2026-04-12）から抽出。
+> English · [日本語](DESIGN.ja.md)
 
-## 出発点：「シェルを作りたい」
+> This document records the thinking that produced ptylenz, distilled
+> from a design conversation on 2026-04-12.
 
-最初のモチベーションは「自分用のシェルを作りたい」だった。
-bash を何のこだわりもなく使っている状態から、同僚の凝った画面（zsh + Oh My Zsh + Powerlevel10k 等）を見て、
-自分の道具は自分で作りたいという欲求が生まれた。
+## Starting point: "I want to write a shell"
 
-## シェルの構造を理解する
+The initial motivation was "I want to write my own shell." Going from "I use bash without any opinions" to seeing colleagues' elaborate setups (zsh + Oh My Zsh + Powerlevel10k) produced the urge to build my own tool.
 
-シェルの本質は REPL（Read-Eval-Print Loop）で、OS とのインターフェースは驚くほど単純：
-- `fork()` — プロセスを複製
-- `exec()` — 子プロセスの中身を置き換え
-- `wait()` — 子の終了を待つ
-- `pipe()` — ファイルディスクリプタを繋ぐ
+## What's actually inside a shell
 
-この 4 つのシステムコールだけで、シェルの実行エンジンは完成する。
-各シェルの差別化ポイントは、この「OS インターフェース」の上に載る **UI 層** にある。
+A shell is fundamentally a REPL, and its interface to the OS is shockingly small:
 
-## bash/zsh/fish/nushell の比較から得た知見
+- `fork()` — duplicate a process
+- `exec()` — replace the child's image
+- `wait()` — wait for the child to finish
+- `pipe()` — connect file descriptors
 
-| 軸 | 競争のポイント |
-|----|-------------|
-| 行編集 | readline vs ZLE vs 自前実装 |
-| 補完 | コールバック方式 vs 宣言的定義 vs 型駆動 |
-| スクリプト言語 | 文字列ベース vs 構造化データ |
-| プロンプト | エスケープシーケンス手書き vs フレームワーク |
+Four syscalls and the execution engine of a shell is done. What differentiates one shell from another lives entirely in the **UI layer** sitting on top of that OS interface.
 
-最も革新的なシェルとして以下を分析：
-- **Warp**: ターミナルエミュレータ自体をRustで再発明。出力をブロック単位で管理
-- **Nushell**: パイプラインに文字列ではなく構造化データ（テーブル）を流す
-- **Oils/YSH**: POSIX 互換を保ちながら、bash からのアップグレードパスを提供
-- **fish**: ゼロコンフィグで最高の対話体験
+## What I learned comparing bash / zsh / fish / nushell
 
-## UBNF シェルの構想と断念
+| Axis | Where they compete |
+|------|--------------------|
+| Line editing | readline vs. ZLE vs. own implementation |
+| Completion | callback-style vs. declarative vs. type-driven |
+| Script language | string-based vs. structured data |
+| Prompt | hand-written escape sequences vs. framework |
 
-unlaxer（UBNF パーサーコンビネータ）を使ったシェル設計を検討した：
-- UBNF 文法定義でシェル文法を宣言的に記述
-- 同じ文法から補完・ハイライト・デバッガを自動生成
-- ユーザーが `.ubnf` ファイルで文法を拡張可能
+The most innovative shells, briefly:
 
-これは技術的には面白いが、**ミイラ取りがミイラになるパターン** と判断。
-作りたいものが山ほどある中で、フルシェルの再発明に時間をかけるべきではない。
+- **Warp** — reinvents the terminal emulator in Rust; output is managed as blocks.
+- **Nushell** — pipelines carry structured data (tables) instead of strings.
+- **Oils / YSH** — POSIX-compatible with an upgrade path from bash.
+- **fish** — best-in-class interactive experience out of the box.
 
-## 本当の痛みの発見
+## The UBNF-shell idea, abandoned
 
-「シェルが欲しい」のではなく、**ターミナル体験が悪い** のが本当の問題だった。
+I considered a shell built on [unlaxer](https://github.com/opaopa6969/unlaxer) (a UBNF parser-combinator):
 
-具体的には、Claude Code / Codex を tmux 内で使う体験が非常に悪い：
-- AI が数千行出力すると、先頭が見えなくなる（スクロール地獄）
-- tmux の選択モードでのコピーが苦痛
-- 「さっきのあれ」をスクロールバックから探す体験が VT100 時代と変わらない
-- ファイルに書き出したり issue を書かせたりして GUI で体験を上げている状態
+- declare shell grammar in UBNF
+- generate completion / highlighting / debugger from the same grammar
+- let users extend the grammar in `.ubnf` files
 
-> 「2026年にスクロールバッファの中から目grepしてるのは何年代だよ」
+Technically interesting, but a classic "the mummy hunter becomes a mummy" trap. With many other things to build, reinventing a full shell is not the right place to spend time.
 
-## 「プロセスが起動した後、shell は何をしているか？」
+## Finding the real pain
 
-ここが最も重要な設計上の洞察：
+It wasn't "I want a shell." The real problem was that the **terminal experience is bad**.
+
+Concretely, using Claude Code / Codex inside tmux is brutal:
+
+- The AI prints thousands of lines and the top scrolls off
+- tmux's selection mode is painful for copying
+- Searching for "that thing earlier" via scrollback is a VT100-era experience
+- Workarounds (write to files, ask Claude to render an HTML report) just to escape the terminal
+
+> "It's 2026 and you're eyeball-grepping a scrollback buffer — what decade is this?"
+
+## "What is the shell doing after the process starts?"
+
+This is the central insight:
 
 ```
 bash (pid=100)
   ├─ fork()
   │    └─ child (pid=101) → exec("claude-code")
-  │         ├─ stdout → PTY → ターミナルエミュレータ
-  │         └─ stderr → PTY → ターミナルエミュレータ
-  └─ wait(101)  ← bash はここで寝てるだけ
+  │         ├─ stdout → PTY → terminal emulator
+  │         └─ stderr → PTY → terminal emulator
+  └─ wait(101)  ← bash is sleeping here
 ```
 
-**bash はデータパスに存在しない。**
-claude-code の出力は PTY（カーネル層）を通ってターミナルに直接行く。
-bash は子プロセスの終了を待っているだけで、出力を一切見ていない。
+**bash is not in the data path.** claude-code's output goes through the PTY (kernel layer) directly to the terminal. bash is just blocked in `wait()`, watching nothing.
 
-したがって、**シェルで出力を構造化するのはレイヤーが間違っている**。
+So **structuring the output at the shell layer is the wrong layer.**
 
-## 介入ポイントの分析
+## Where can we intervene?
 
-出力ストリームに介入できるポイントは 4 つ：
+There are four places to put a hand on the output stream:
 
-| 方法 | 説明 | 例 |
-|------|------|-----|
-| A. ターミナルエミュレータ | レンダラー自体を再発明 | Warp |
-| B. PTY プロキシ | master 側に座って全 I/O を中継 | tmux |
-| C. シェルインテグレーション | OSC マーカーで境界を通知 | iTerm2, VS Code Terminal |
-| D. プロセス変更 | 出力元を改造 | 制御不可 |
+| Approach | Description | Example |
+|----------|-------------|---------|
+| A. Terminal emulator | reinvent the renderer | Warp |
+| B. PTY proxy | sit on the master side and relay everything | tmux |
+| C. Shell integration | emit OSC markers at boundaries | iTerm2, VS Code Terminal |
+| D. Modify the producer | change the source program | not in our control |
 
-**結論: B + C の組み合わせ** が最適。
-- PTY プロキシ（B）で全データを通過させ
-- シェルインテグレーション（C）でブロック境界を検出する
+**Conclusion: B + C.** Use a PTY proxy (B) to see every byte, and shell integration (C) to detect block boundaries precisely.
 
-## syslenz との類似性
+## The parallel with syslenz
 
 ```
-syslenz:  /proc (カーネル提供テキスト) → 構造化 → TUI
-ptylenz:  PTY   (カーネル提供テキスト) → 構造化 → TUI
+syslenz: /proc (kernel-provided text)  → structure → TUI
+ptylenz: PTY   (kernel-provided text)  → structure → TUI
 ```
 
-同じパターン。同じ動機（「cat /proc が70年代かよ」≒「スクロールバックの目grepは何年代だよ」）。
-同じ技術基盤（Rust + ratatui）。
+Same pattern. Same motivation ("`cat /proc` is 70s UX" ≈ "scrollback grep is also 70s UX"). Same tech base (Rust + ratatui).
 
-## 設計原則
+## Design principles
 
-1. **ゼロコンフィグで 80 点** — バイナリ 1 つ、設定不要
-2. **bash を壊さない** — 内側に抱えるだけ、置き換えない
-3. **出力ブロック化が全て解く** — スクロール・コピー・検索が同時に解決
-4. **空間は必要な時に現れる** — 常時パネルではなく、文脈に応じたUI
-5. **後から拡張可能** — UBNF 補完、syslenz 統合、DAP は後付けで足せる
+1. **Zero config, 80% by default** — single binary, no setup
+2. **Don't break bash** — wrap it on the inside, never replace it
+3. **Block-shaped output solves everything** — scroll, copy, search all dissolve at once
+4. **Surface space only when asked** — no permanent panel; UI appears in context
+5. **Future extensions plug in** — UBNF completion, syslenz integration, DAP can all attach later
 
-## 名前の由来
+## Where the name comes from
 
-syslenz = system + lens（システムを覗き込むレンズ）
-ptylenz = PTY + lens（PTY ストリームを覗き込むレンズ）
+- syslenz = system + lens (a lens onto your system)
+- ptylenz = PTY + lens (a lens onto your PTY stream)
 
-`lenz` ファミリーとして、同じ設計哲学を共有する兄弟プロジェクト。
+Two siblings in a `lenz` family with the same design philosophy.
 
-## 将来の拡張可能性（今は作らない）
+## Future expansion (not now)
 
-- UBNF ベースのシェル入力補完（LSP 経由、別プロセス）
-- シェルスクリプトの TUI デバッガ（DAP 経由、別プロセス）
-- syslenz パネルの統合（ptylenz のパネルの 1 つとして）
-- 構造化パイプライン（nushell 的）
-- AI 出力の意味解析（diff 検出、ファイル変更要約）
-- セッション永続化（tmux 置き換え）
+- UBNF-based shell input completion (LSP, separate process)
+- Shell-script TUI debugger (DAP, separate process)
+- Embedded syslenz panel (one of ptylenz's panels)
+- Structured pipelines (nushell-style)
+- Semantic analysis of AI output (diff detection, file-change summaries)
+- Session persistence (replace tmux for that purpose)
