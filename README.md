@@ -55,6 +55,12 @@ chmod +x ptylenz && sudo mv ptylenz /usr/local/bin/
 ### From source
 
 ```bash
+./install.sh
+```
+
+Runs `cargo install --path . --force` under the hood and drops the binary in `~/.cargo/bin/ptylenz`. Re-run after `git pull` to update. Or do it manually:
+
+```bash
 cargo install --path .
 ```
 
@@ -162,9 +168,18 @@ case $- in *i*) ;; *) return ;; esac
 
 If ptylenz crashes, every new shell will also fail — so wait until you've used it long enough to trust it before enabling. Recovery: `bash --norc`.
 
+## Platform support
+
+ptylenz runs on **Linux** (x86_64) and **macOS** (Apple Silicon, Intel).  
+**Windows is not supported** and is not on the roadmap.
+
 ## Documentation
 
-- [PROJECT.md](PROJECT.md) — architecture, design decisions, implementation notes
+- [docs/getting-started.md](docs/getting-started.md) — install, first run, troubleshooting
+- [docs/architecture.md](docs/architecture.md) — PTY proxy, OSC parser, vt100 shadow, ratatui overlay
+- [docs/shell-integration.md](docs/shell-integration.md) — OSC 133 setup, bash/zsh/fish reference
+- [CHANGELOG.md](CHANGELOG.md) — version history
+- [PROJECT.md](PROJECT.md) — handoff document: architecture, design decisions, implementation notes
 - [DESIGN.md](DESIGN.md) — the rationale that led to ptylenz
 
 ## License

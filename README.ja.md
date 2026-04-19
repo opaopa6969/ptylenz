@@ -55,6 +55,12 @@ chmod +x ptylenz && sudo mv ptylenz /usr/local/bin/
 ### ソースから
 
 ```bash
+./install.sh
+```
+
+内部で `cargo install --path . --force` を実行して `~/.cargo/bin/ptylenz` に置く。更新時も同じコマンドで OK。手動なら:
+
+```bash
 cargo install --path .
 ```
 
@@ -161,8 +167,17 @@ case $- in *i*) ;; *) return ;; esac
 
 ptylenz が落ちると新しいシェルがすべて詰まる可能性があるので、しばらく使って安定を確認してから入れるのを推奨。リカバリは `bash --norc`。
 
+## 対応プラットフォーム
+
+ptylenz は **Linux** (x86_64) および **macOS** (Apple Silicon・Intel) で動作する。  
+**Windows は未対応**であり、対応予定もない。
+
 ## ドキュメント
 
+- [docs/getting-started-ja.md](docs/getting-started-ja.md) — インストール、初回起動、トラブルシューティング
+- [docs/architecture-ja.md](docs/architecture-ja.md) — PTY プロキシ、OSC パーサ、vt100 シャドウ、ratatui オーバーレイ
+- [docs/shell-integration-ja.md](docs/shell-integration-ja.md) — OSC 133 セットアップ、bash/zsh/fish リファレンス
+- [CHANGELOG.md](CHANGELOG.md) — バージョン履歴
 - [PROJECT.ja.md](PROJECT.ja.md) — アーキテクチャ、設計判断、実装ノート
 - [DESIGN.ja.md](DESIGN.ja.md) — 設計判断に至るまでの思考プロセス
 
