@@ -61,6 +61,14 @@ esac
 
 よくある問題: `~/.bashrc` の末尾付近に `PROMPT_COMMAND="something"` が含まれているケース。ptylenz はまず `~/.bashrc` を source してから `PROMPT_COMMAND='__ptylenz_precmd'` をセットするので、その順序では正しく動作する。しかし、`~/.bashrc` が末尾で別のファイル (会社の dotfile など) を source し、そのファイルが `PROMPT_COMMAND` を再設定すると ptylenz の設定が上書きされる。
 
+対処法: 上書きではなく連結形式を使う。
+
+```bash
+PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND};}your_function"
+```
+
+`${PROMPT_COMMAND:+${PROMPT_COMMAND};}` は既存の値がある場合のみ `値;` に展開されるため、ptylenz の有無に関わらず安全に使用できる。
+
 詳細な設計判断は [docs/decisions/prompt-command-strategy.md](decisions/prompt-command-strategy.md) を参照。
 
 ### DEBUG トラップではなく PROMPT_COMMAND を使う理由

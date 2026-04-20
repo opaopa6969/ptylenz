@@ -61,15 +61,24 @@ esac
 
 Common problem: a `~/.bashrc` that contains `PROMPT_COMMAND="something"` near the end. ptylenz sources `~/.bashrc` first, then sets `PROMPT_COMMAND='__ptylenz_precmd'`, so in that order it works correctly. However, if your `~/.bashrc` sources another file at the end (e.g. a company dotfile) that also sets `PROMPT_COMMAND`, ptylenz's assignment will be overwritten.
 
-Fix: either chain the other function instead of overwriting:
+Fix: chain the other function instead of overwriting. Replace any bare assignment like:
 
 ```bash
-# in ~/.bashrc, if you need to keep an existing PROMPT_COMMAND
-# and also support ptylenz:
-# (ptylenz sets PROMPT_COMMAND='__ptylenz_precmd' after sourcing ~/.bashrc,
-#  so this should be fine in most cases — only an issue if another file is
-#  sourced after the wrapper sets it)
+PROMPT_COMMAND="your_function"
 ```
+
+with a chained form that preserves whatever is already set:
+
+```bash
+# Append to PROMPT_COMMAND rather than overwriting it.
+# This keeps ptylenz's __ptylenz_precmd in the chain even when
+# ptylenz sets it after sourcing ~/.bashrc.
+PROMPT_COMMAND="${PROMPT_COMMAND:+${PROMPT_COMMAND};}your_function"
+```
+
+The `${PROMPT_COMMAND:+${PROMPT_COMMAND};}` idiom expands to the existing
+value (plus a `;` separator) only when `PROMPT_COMMAND` is non-empty, so it is
+safe to use whether or not ptylenz is present.
 
 See [docs/decisions/prompt-command-strategy.md](decisions/prompt-command-strategy.md) for the full rationale.
 

@@ -97,10 +97,7 @@ pub fn spawn_watcher(cwd: &Path) -> Receiver<ClaudeEvent> {
 ///   - ptylenz must work over SSH-forwarded homedirs where inotify may not
 ///     propagate,
 ///   - polling every 500ms is cheap enough for our workload,
-///   - it keeps the dependency graph smaller (we pulled `notify` in the
-///     Cargo.toml but never rely on its async guts — the poll path below
-///     is the one we ship today; `notify` is kept available for a future
-///     revision).
+///   - it keeps the dependency graph smaller (no `notify` crate needed).
 fn run_watch_loop(dir: &Path, tx: Sender<ClaudeEvent>) -> Result<()> {
     let mut active: Option<(PathBuf, u64)> = None; // (path, file offset)
     loop {

@@ -179,7 +179,6 @@ impl PtyProxy {
         &self.block_engine
     }
 
-    #[allow(dead_code)]
     pub fn blocks_mut(&mut self) -> &mut BlockEngine {
         &mut self.block_engine
     }
@@ -279,5 +278,143 @@ mod tests {
             .iter()
             .any(|b| b.command.as_deref().map_or(false, |c| c.contains("echo hello-ptylenz")));
         assert!(any_echo, "expected to capture the echo command; blocks={:?}", blocks.iter().map(|b| &b.command).collect::<Vec<_>>());
+    }
+
+    /// End-to-end: run a command that enters the alternate screen (the mc /
+    /// claude lineage), writes content, and exits. Verify that a block is
+    /// produced and that rendered_text carries the vt100 snapshot of the
+    /// alt-screen frame — the path that list/detail rendering depends on for
+    /// TUI apps.
+    #[test]
+    fn alt_screen_command_produces_rendered_text() {
+        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        unsafe {
+            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
+            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        thread::sleep(Duration::from_millis(400));
+        let _ = proxy.read_output(&mut buf);
+
+        // Start an alt-screen session, idle in it, then leave. The sleep
+        // guarantees that the post-entry output arrives in a separate read
+        // from the alt-screen-leave, so vt100's shadow grid sees
+        // alternate_screen() == true at least once during feed_output() and
+        // last_alt_snapshot actually captures a frame. This matches the real
+        // mc/claude lineage where the TUI lives in alt-screen across many
+        // reads.
+        proxy
+            .write_input(
+                b"printf '\\e[?1049h\\e[2J\\e[1;1HTUI-MARKER-XYZZY hello'; sleep 0.4; printf '\\e[?1049l'; echo done\n",
+            )
+            .unwrap();
+
+        // Drain across the sleep so feed_output() sees alt-screen bytes,
+        // pauses (no data), then later sees the exit-alt bytes.
+        let mid_deadline = Instant::now() + Duration::from_millis(900);
+        while Instant::now() < mid_deadline {
+            let _ = proxy.read_output(&mut buf);
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        proxy.write_input(b"exit\n").unwrap();
+
+        while Instant::now() < deadline {
+            match proxy.read_output(&mut buf) {
+                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            if !proxy.child_alive() {
+                let _ = proxy.read_output(&mut buf);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let blocks = proxy.blocks().completed_blocks();
+        let alt_block = blocks.iter().find(|b| {
+            b.command
+                .as_deref()
+                .map_or(false, |c| c.contains("TUI-MARKER"))
+        });
+        assert!(
+            alt_block.is_some(),
+            "expected an alt-screen block; blocks={:?}",
+            blocks.iter().map(|b| &b.command).collect::<Vec<_>>()
+        );
+        let rendered = alt_block.unwrap().rendered_text.as_deref();
+        assert!(
+            rendered.map_or(false, |s| s.contains("TUI-MARKER-XYZZY")),
+            "expected rendered_text to contain the alt-screen token; rendered={:?}",
+            rendered
+        );
+    }
+
+    /// Regression: a plain `ls`-style command (no alt-screen) must produce
+    /// a block whose output_text contains the visible output — i.e. the
+    /// non-alt-screen path hasn't been broken by recent changes to the vt100
+    /// mirroring / line_count caching.
+    #[test]
+    fn plain_command_captures_visible_output() {
+        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 8192];
+        unsafe {
+            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
+            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        thread::sleep(Duration::from_millis(400));
+        let _ = proxy.read_output(&mut buf);
+
+        proxy
+            .write_input(b"echo LINE-ONE; echo LINE-TWO; echo LINE-THREE\n")
+            .unwrap();
+        proxy.write_input(b"exit\n").unwrap();
+
+        while Instant::now() < deadline {
+            match proxy.read_output(&mut buf) {
+                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
+                Ok(_) => {}
+                Err(_) => {}
+            }
+            if !proxy.child_alive() {
+                let _ = proxy.read_output(&mut buf);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let blocks = proxy.blocks().completed_blocks();
+        let echo_block = blocks
+            .iter()
+            .find(|b| b.command.as_deref().map_or(false, |c| c.contains("LINE-ONE")));
+        assert!(
+            echo_block.is_some(),
+            "expected a non-alt-screen block for the echo command; blocks={:?}",
+            blocks.iter().map(|b| &b.command).collect::<Vec<_>>()
+        );
+        let b = echo_block.unwrap();
+        let text = b.output_text();
+        assert!(text.contains("LINE-ONE"), "missing LINE-ONE; text={:?}", text);
+        assert!(text.contains("LINE-TWO"), "missing LINE-TWO; text={:?}", text);
+        assert!(text.contains("LINE-THREE"), "missing LINE-THREE; text={:?}", text);
+        // cached_line_count should match the number of newlines we actually saw.
+        let actual_newlines = b.output.iter().filter(|&&c| c == b'\n').count();
+        assert_eq!(
+            b.cached_line_count, actual_newlines,
+            "cached_line_count drifted from actual newline count"
+        );
     }
 }
