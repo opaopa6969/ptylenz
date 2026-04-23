@@ -19,6 +19,7 @@
 
 use chrono::{DateTime, Local};
 use regex::bytes::Regex;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::claude_feeder::{ClaudeEvent, ToolUse};
 
@@ -70,6 +71,12 @@ pub struct Block {
     /// the raw `output` buffer — that path preserves scrollback beyond the
     /// shadow grid's capacity.
     pub rendered_text: Option<String>,
+    /// Running count of '\n' bytes seen in `output`, maintained on every
+    /// append. Replaces the previous O(total output size) scan in
+    /// `line_count()` — which was called once per block per redraw and made
+    /// the list take seconds to render once mc/claude accumulated megabytes
+    /// of raw stream.
+    pub cached_line_count: usize,
 }
 
 impl Block {
@@ -85,6 +92,7 @@ impl Block {
             pinned: false,
             source: BlockSource::Shell,
             rendered_text: None,
+            cached_line_count: 0,
         }
     }
 
@@ -94,9 +102,14 @@ impl Block {
         matches!(self.source, BlockSource::ClaudeTurn { .. })
     }
 
-    /// Number of lines in the output.
+    /// Number of lines in the output. For alt-screen TUI blocks prefer the
+    /// rendered snapshot's height (visual rows) — that's what the user
+    /// actually sees. Otherwise return the running newline count.
     pub fn line_count(&self) -> usize {
-        self.output.iter().filter(|&&b| b == b'\n').count()
+        if let Some(ref rendered) = self.rendered_text {
+            return rendered.bytes().filter(|&b| b == b'\n').count() + 1;
+        }
+        self.cached_line_count
     }
 
     /// Output as lossy UTF-8 string (for display/search).
@@ -222,11 +235,14 @@ impl BlockEngine {
 
                 let rendered = render_turn(&role, &text, &tool_uses);
                 let now = Local::now();
+                let output_bytes = rendered.into_bytes();
+                let newline_count =
+                    output_bytes.iter().filter(|&&b| b == b'\n').count();
 
                 let mut block = Block {
                     id,
                     command: Some(format!("claude {} #{}", role, turn_index)),
-                    output: rendered.into_bytes(),
+                    output: output_bytes,
                     exit_code: Some(0),
                     started_at: now,
                     ended_at: Some(now),
@@ -239,6 +255,7 @@ impl BlockEngine {
                         tool_uses,
                     },
                     rendered_text: None,
+                    cached_line_count: newline_count,
                 };
                 if block.line_count() > 50 {
                     block.collapsed = true;
@@ -256,83 +273,116 @@ impl BlockEngine {
     /// Feed raw PTY output bytes into the engine.
     /// Returns the clean stream (OSC 133 markers stripped) plus any events
     /// detected, so callers can forward the clean bytes to stdout.
+    ///
+    /// Internally iterates the parsed chunks in stream order so bytes are
+    /// attributed to whichever block is current _at that point_ — important
+    /// when CommandStart / CommandEnd / next CommandStart all fall inside a
+    /// single read() (common: the previous command's tail and the new
+    /// command's PS0 land together once bash is busy).
     pub fn feed_output(&mut self, data: &[u8]) -> (Vec<u8>, Vec<OscEvent>) {
-        let (clean_data, osc_events) = self.osc_parser.parse(data);
+        let chunks = self.osc_parser.parse(data);
 
-        for event in &osc_events {
-            match event {
-                OscEvent::CommandStart => {
-                    // Start a new block with a fresh vt100 shadow parser.
-                    let block = Block::new(self.next_id);
-                    self.next_id += 1;
-                    self.current = Some(block);
-                    self.vt_parser = Some(vt100::Parser::new(
-                        self.term_rows,
-                        self.term_cols,
-                        VT_SCROLLBACK_ROWS,
-                    ));
-                    self.last_alt_snapshot = None;
+        let mut all_clean: Vec<u8> = Vec::with_capacity(data.len());
+        let mut all_events: Vec<OscEvent> = Vec::new();
+
+        for chunk in chunks {
+            match chunk {
+                ParseChunk::Bytes(bytes) => {
+                    self.append_clean(&bytes);
+                    all_clean.extend_from_slice(&bytes);
                 }
-                OscEvent::CommandText(cmd) => {
-                    // The iTerm2 protocol emits 133;E at prompt time; our bash
-                    // integration emits it from PROMPT_COMMAND (after CommandEnd),
-                    // so attach to the current block if open, else to the last
-                    // closed block.
+                ParseChunk::Event(event) => {
+                    self.handle_event(&event);
+                    all_events.push(event);
+                }
+            }
+        }
+
+        (all_clean, all_events)
+    }
+
+    fn handle_event(&mut self, event: &OscEvent) {
+        match event {
+            OscEvent::CommandStart => {
+                let block = Block::new(self.next_id);
+                self.next_id += 1;
+                self.current = Some(block);
+                self.vt_parser = Some(vt100::Parser::new(
+                    self.term_rows,
+                    self.term_cols,
+                    VT_SCROLLBACK_ROWS,
+                ));
+                self.last_alt_snapshot = None;
+            }
+            OscEvent::CommandText(cmd) => {
+                // iTerm2 protocol emits 133;E at prompt time; our bash
+                // integration emits it from PROMPT_COMMAND (after
+                // CommandEnd), so attach to the current block if open,
+                // else to the last closed block.
+                if let Some(ref mut block) = self.current {
+                    block.command = Some(cmd.clone());
+                } else if let Some(last) = self.blocks.last_mut() {
+                    if last.command.is_none() {
+                        last.command = Some(cmd.clone());
+                    }
+                }
+            }
+            OscEvent::CommandEnd { exit_code } => {
+                if let Some(mut block) = self.current.take() {
+                    block.exit_code = Some(*exit_code);
+                    block.ended_at = Some(Local::now());
+                    self.finalize_rendered_text(&mut block);
+                    if block.line_count() > 50 {
+                        block.collapsed = true;
+                    }
+                    self.blocks.push(block);
+                }
+                self.vt_parser = None;
+                self.last_alt_snapshot = None;
+            }
+            OscEvent::PromptStart => {
+                if let Some(mut block) = self.current.take() {
+                    block.ended_at = Some(Local::now());
+                    self.finalize_rendered_text(&mut block);
+                    if block.line_count() > 50 {
+                        block.collapsed = true;
+                    }
+                    self.blocks.push(block);
+                }
+                self.vt_parser = None;
+                self.last_alt_snapshot = None;
+            }
+        }
+    }
+
+    fn append_clean(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(ref mut block) = self.current {
+            block.output.extend_from_slice(bytes);
+            block.cached_line_count += bytes.iter().filter(|&&b| b == b'\n').count();
+        }
+        // Tee into the shadow parser. While alt-screen is live we resample
+        // and mirror the snapshot into both `last_alt_snapshot` (for
+        // finalize on exit) and `current.rendered_text` (so expanded list /
+        // detail views render a coherent frame instead of the raw byte
+        // buffer — that path still holds \r, partial redraws, and charset
+        // switches that strip_ansi can't unwind). All-whitespace frames are
+        // skipped because mc blanks its alt-screen right before leaving;
+        // overwriting with that frame would leave the user with nothing.
+        if let Some(parser) = self.vt_parser.as_mut() {
+            parser.process(bytes);
+            if parser.screen().alternate_screen() {
+                let snap = normalize_vt_snapshot(&parser.screen().contents());
+                if !snap.is_empty() {
                     if let Some(ref mut block) = self.current {
-                        block.command = Some(cmd.clone());
-                    } else if let Some(last) = self.blocks.last_mut() {
-                        if last.command.is_none() {
-                            last.command = Some(cmd.clone());
-                        }
+                        block.rendered_text = Some(snap.clone());
                     }
-                }
-                OscEvent::CommandEnd { exit_code } => {
-                    if let Some(mut block) = self.current.take() {
-                        block.exit_code = Some(*exit_code);
-                        block.ended_at = Some(Local::now());
-                        self.finalize_rendered_text(&mut block);
-                        if block.line_count() > 50 {
-                            block.collapsed = true;
-                        }
-                        self.blocks.push(block);
-                    }
-                    self.vt_parser = None;
-                    self.last_alt_snapshot = None;
-                }
-                OscEvent::PromptStart => {
-                    // If there's an open block without a proper end, close it
-                    if let Some(mut block) = self.current.take() {
-                        block.ended_at = Some(Local::now());
-                        self.finalize_rendered_text(&mut block);
-                        if block.line_count() > 50 {
-                            block.collapsed = true;
-                        }
-                        self.blocks.push(block);
-                    }
-                    self.vt_parser = None;
-                    self.last_alt_snapshot = None;
+                    self.last_alt_snapshot = Some(snap);
                 }
             }
         }
-
-        if !clean_data.is_empty() {
-            if let Some(ref mut block) = self.current {
-                block.output.extend_from_slice(&clean_data);
-            }
-            // Tee into the shadow parser so a live TUI's grid is tracked in
-            // parallel with the raw buffer.
-            if let Some(parser) = self.vt_parser.as_mut() {
-                parser.process(&clean_data);
-                // Resample while alt-screen is live so we capture the final
-                // frame before the TUI restores the primary screen on exit.
-                if parser.screen().alternate_screen() {
-                    self.last_alt_snapshot =
-                        Some(normalize_vt_snapshot(&parser.screen().contents()));
-                }
-            }
-        }
-
-        (clean_data, osc_events)
     }
 
     /// Commit the last alt-screen frame captured for this block into
@@ -531,6 +581,15 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// One piece of a parsed stream: either a run of plain bytes (which may
+/// still contain non-OSC escapes) or a detected OSC 133 event. Ordering
+/// carries real meaning — see `OscParser::parse`.
+#[derive(Debug, Clone)]
+enum ParseChunk {
+    Bytes(Vec<u8>),
+    Event(OscEvent),
+}
+
 /// OSC escape sequence parser.
 /// Detects \e]133;X;...\a patterns in a byte stream.
 struct OscParser {
@@ -558,8 +617,14 @@ impl OscParser {
         }
     }
 
-    /// Parse a chunk of bytes.
-    /// Returns (clean_data_without_osc, detected_events).
+    /// Parse a chunk of bytes into a time-ordered stream of clean-data runs
+    /// and OSC 133 events. Callers that need to associate bytes with the
+    /// block state _at the moment those bytes arrived_ (i.e. the block
+    /// engine, which toggles its current block on CommandStart / CommandEnd)
+    /// must iterate the returned chunks in order — collapsing everything to
+    /// `(all_bytes, all_events)` loses the interleaving and attributes
+    /// output to the wrong block when multiple events fall inside a single
+    /// read().
     ///
     /// OSC 133 sequences are consumed (they are ptylenz's block-boundary
     /// markers and must not reach the user's terminal). Every other OSC —
@@ -568,9 +633,15 @@ impl OscParser {
     /// downstream terminals keep working. ncurses apps like `mc` also rely
     /// on color-query OSCs returning, so silently dropping them is not
     /// neutral: it can change how the child draws.
-    fn parse(&mut self, data: &[u8]) -> (Vec<u8>, Vec<OscEvent>) {
-        let mut clean = Vec::with_capacity(data.len());
-        let mut events = Vec::new();
+    fn parse(&mut self, data: &[u8]) -> Vec<ParseChunk> {
+        let mut out: Vec<ParseChunk> = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+
+        let flush_bytes = |pending: &mut Vec<u8>, out: &mut Vec<ParseChunk>| {
+            if !pending.is_empty() {
+                out.push(ParseChunk::Bytes(std::mem::take(pending)));
+            }
+        };
 
         for &byte in data {
             match self.state {
@@ -578,7 +649,7 @@ impl OscParser {
                     if byte == 0x1b {
                         self.state = ParseState::Escape;
                     } else {
-                        clean.push(byte);
+                        pending.push(byte);
                     }
                 }
                 ParseState::Escape => {
@@ -586,9 +657,8 @@ impl OscParser {
                         self.state = ParseState::OscStart;
                         self.buf.clear();
                     } else {
-                        // Not an OSC, emit the escape + this byte
-                        clean.push(0x1b);
-                        clean.push(byte);
+                        pending.push(0x1b);
+                        pending.push(byte);
                         self.state = ParseState::Normal;
                     }
                 }
@@ -597,23 +667,21 @@ impl OscParser {
                     self.buf.push(byte);
                 }
                 ParseState::OscBody => {
-                    if byte == 0x07 {
-                        self.finish_osc(&mut clean, &mut events, byte);
-                    } else if byte == 0x1b {
-                        // ESC starts ST (ESC \) — treat as terminator.
-                        self.finish_osc(&mut clean, &mut events, byte);
+                    if byte == 0x07 || byte == 0x1b {
+                        // Emit any bytes that accumulated _before_ this OSC
+                        // so the event sits at the correct point in the
+                        // stream.
+                        self.finish_osc(&mut pending, &mut out, byte);
                     } else {
                         self.buf.push(byte);
                     }
                 }
                 ParseState::OscStSwallow => {
-                    // Expected to swallow a trailing `\` completing ESC ST.
-                    // Anything else — step back into Normal handling.
                     if byte != b'\\' {
                         if byte == 0x1b {
                             self.state = ParseState::Escape;
                         } else {
-                            clean.push(byte);
+                            pending.push(byte);
                             self.state = ParseState::Normal;
                         }
                         continue;
@@ -623,19 +691,27 @@ impl OscParser {
             }
         }
 
-        (clean, events)
+        flush_bytes(&mut pending, &mut out);
+        out
     }
 
-    /// Finalize the current OSC body: either decode it as an OSC 133 event
-    /// (consumed) or re-emit the original bytes verbatim so the terminal
-    /// still receives them.
-    fn finish_osc(&mut self, clean: &mut Vec<u8>, events: &mut Vec<OscEvent>, terminator: u8) {
+    /// Finalize the current OSC body: either record it as an event (OSC 133
+    /// is consumed) or re-emit the original bytes verbatim so the terminal
+    /// still receives them. Bytes that accumulated _before_ this OSC are
+    /// flushed first so the event lands in the right place in the stream.
+    fn finish_osc(
+        &mut self,
+        pending: &mut Vec<u8>,
+        out: &mut Vec<ParseChunk>,
+        terminator: u8,
+    ) {
         let payload = std::mem::take(&mut self.buf);
         match self.decode_osc(&payload) {
             Some(event) => {
-                events.push(event);
-                // If the OSC was ST-terminated (ESC \), swallow the trailing
-                // `\` so it doesn't leak to the terminal as a stray byte.
+                if !pending.is_empty() {
+                    out.push(ParseChunk::Bytes(std::mem::take(pending)));
+                }
+                out.push(ParseChunk::Event(event));
                 self.state = if terminator == 0x1b {
                     ParseState::OscStSwallow
                 } else {
@@ -643,10 +719,10 @@ impl OscParser {
                 };
             }
             None => {
-                clean.push(0x1b);
-                clean.push(b']');
-                clean.extend_from_slice(&payload);
-                clean.push(terminator);
+                pending.push(0x1b);
+                pending.push(b']');
+                pending.extend_from_slice(&payload);
+                pending.push(terminator);
                 self.state = ParseState::Normal;
             }
         }
@@ -695,18 +771,31 @@ fn render_turn(role: &str, text: &str, tool_uses: &[ToolUse]) -> String {
         out.push_str("→ ");
         out.push_str(&t.name);
         out.push('(');
-        // Truncate very large inputs so the block summary stays useful.
-        let max = 500;
-        if t.input_json.len() > max {
-            out.push_str(&t.input_json[..max]);
-            out.push_str("…");
-        } else {
-            out.push_str(&t.input_json);
-        }
+        append_truncated(&mut out, &t.input_json, 500);
         out.push(')');
         out.push('\n');
     }
     out
+}
+
+/// Append `s` to `out`, truncated to at most `max_bytes` worth of grapheme
+/// clusters (plus an ellipsis if anything was cut). Walking clusters instead
+/// of bytes means ZWJ sequences (family emojis, flag sequences, etc.) survive
+/// intact rather than being split mid-cluster into broken forms.
+fn append_truncated(out: &mut String, s: &str, max_bytes: usize) {
+    if s.len() <= max_bytes {
+        out.push_str(s);
+        return;
+    }
+    let mut taken = 0;
+    for g in s.graphemes(true) {
+        if taken + g.len() > max_bytes {
+            break;
+        }
+        out.push_str(g);
+        taken += g.len();
+    }
+    out.push('…');
 }
 
 /// Normalize a vt100 screen snapshot for display in a narrower overlay area.
@@ -757,11 +846,26 @@ fn strip_ansi(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Flatten ParseChunk stream back to (all_bytes, all_events) for the
+    /// older tests that pre-date the interleaved API. Production code goes
+    /// through `BlockEngine::feed_output` which iterates chunks in order.
+    fn parse_flat(parser: &mut OscParser, data: &[u8]) -> (Vec<u8>, Vec<OscEvent>) {
+        let mut bytes = Vec::new();
+        let mut events = Vec::new();
+        for chunk in parser.parse(data) {
+            match chunk {
+                ParseChunk::Bytes(b) => bytes.extend_from_slice(&b),
+                ParseChunk::Event(e) => events.push(e),
+            }
+        }
+        (bytes, events)
+    }
+
     #[test]
     fn test_osc_parser_detects_command_start() {
         let mut parser = OscParser::new();
         let input = b"hello\x1b]133;C\x07world";
-        let (clean, events) = parser.parse(input);
+        let (clean, events) = parse_flat(&mut parser, input);
 
         assert_eq!(clean, b"helloworld");
         assert_eq!(events.len(), 1);
@@ -772,7 +876,7 @@ mod tests {
     fn test_osc_parser_detects_command_end() {
         let mut parser = OscParser::new();
         let input = b"\x1b]133;D;0\x07";
-        let (_, events) = parser.parse(input);
+        let (_, events) = parse_flat(&mut parser, input);
 
         assert_eq!(events.len(), 1);
         if let OscEvent::CommandEnd { exit_code } = &events[0] {
@@ -786,7 +890,7 @@ mod tests {
     fn test_osc_parser_detects_command_text() {
         let mut parser = OscParser::new();
         let input = b"\x1b]133;E;ls -la\x07";
-        let (_, events) = parser.parse(input);
+        let (_, events) = parse_flat(&mut parser, input);
 
         assert_eq!(events.len(), 1);
         if let OscEvent::CommandText(cmd) = &events[0] {
@@ -808,15 +912,15 @@ mod tests {
         let link = b"\x1b]8;;https://example.com\x07click\x1b]8;;\x07";
         let color_query_st = b"\x1b]11;?\x1b\\";
 
-        let (clean_title, ev_title) = parser.parse(title);
+        let (clean_title, ev_title) = parse_flat(&mut parser, title);
         assert!(ev_title.is_empty());
         assert_eq!(&clean_title[..], &title[..]);
 
-        let (clean_link, ev_link) = parser.parse(link);
+        let (clean_link, ev_link) = parse_flat(&mut parser, link);
         assert!(ev_link.is_empty());
         assert_eq!(&clean_link[..], &link[..]);
 
-        let (clean_q, ev_q) = parser.parse(color_query_st);
+        let (clean_q, ev_q) = parse_flat(&mut parser, color_query_st);
         assert!(ev_q.is_empty());
         assert_eq!(&clean_q[..], &color_query_st[..]);
     }
@@ -827,7 +931,7 @@ mod tests {
         // leaving no stray backslash in the clean stream.
         let mut parser = OscParser::new();
         let input = b"before\x1b]133;C\x1b\\after";
-        let (clean, events) = parser.parse(input);
+        let (clean, events) = parse_flat(&mut parser, input);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], OscEvent::CommandStart));
         assert_eq!(&clean[..], b"beforeafter");
@@ -1039,5 +1143,209 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(matches!(blocks[0].source, BlockSource::Shell));
         assert!(blocks[1].is_claude_turn());
+    }
+
+    #[test]
+    fn append_truncated_short_passes_through() {
+        let mut out = String::new();
+        append_truncated(&mut out, "hello", 100);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn append_truncated_ascii_cuts_at_limit_with_ellipsis() {
+        let mut out = String::new();
+        append_truncated(&mut out, "abcdefghij", 4);
+        assert_eq!(out, "abcd…");
+    }
+
+    #[test]
+    fn append_truncated_multibyte_never_splits_codepoint() {
+        // 'ル' is 3 bytes in UTF-8. With max_bytes=2, nothing fits.
+        let mut out = String::new();
+        append_truncated(&mut out, "ルビー", 2);
+        assert_eq!(out, "…");
+
+        // max_bytes=3 takes exactly one char.
+        out.clear();
+        append_truncated(&mut out, "ルビー", 3);
+        assert_eq!(out, "ル…");
+
+        // max_bytes=5: only one 3-byte char fits (second would overshoot).
+        out.clear();
+        append_truncated(&mut out, "ルビー", 5);
+        assert_eq!(out, "ル…");
+    }
+
+    #[test]
+    fn append_truncated_keeps_zwj_sequence_intact() {
+        // Family emoji: 👨‍👩‍👧 = U+1F468 ZWJ U+1F469 ZWJ U+1F467
+        //   = 4 + 3 + 4 + 3 + 4 = 18 bytes, but one grapheme cluster.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(family.len(), 18);
+
+        // Budget below cluster size: nothing of it fits → no partial family.
+        let mut out = String::new();
+        append_truncated(&mut out, family, 10);
+        assert_eq!(out, "…", "should not emit a partial ZWJ sequence");
+
+        // Budget at exactly cluster size: whole family survives.
+        out.clear();
+        append_truncated(&mut out, &format!("{family}X"), 18);
+        assert_eq!(out, format!("{family}…"));
+    }
+
+    // ----- New tests added to satisfy the spec requirements -----
+
+    #[test]
+    fn test_osc_parser_plain_text_no_events() {
+        // Plain bytes with no OSC sequences must pass through unchanged with
+        // zero events emitted.
+        let mut parser = OscParser::new();
+        let input = b"just plain output\nno escapes here\n";
+        let (clean, events) = parse_flat(&mut parser, input);
+        assert_eq!(clean, input.as_ref());
+        assert!(events.is_empty(), "expected no events for plain text");
+    }
+
+    #[test]
+    fn test_osc_parser_detects_prompt_start() {
+        let mut parser = OscParser::new();
+        let input = b"\x1b]133;A\x07";
+        let (clean, events) = parse_flat(&mut parser, input);
+        assert!(clean.is_empty());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OscEvent::PromptStart));
+    }
+
+    #[test]
+    fn test_osc_parser_command_end_nonzero_exit() {
+        let mut parser = OscParser::new();
+        let input = b"\x1b]133;D;1\x07";
+        let (_, events) = parse_flat(&mut parser, input);
+        assert_eq!(events.len(), 1);
+        if let OscEvent::CommandEnd { exit_code } = &events[0] {
+            assert_eq!(*exit_code, 1);
+        } else {
+            panic!("Expected CommandEnd");
+        }
+    }
+
+    #[test]
+    fn test_osc_parser_mixed_text_and_osc() {
+        // Bytes before the OSC marker must be preserved as clean output; the
+        // OSC itself must be consumed and produce an event.
+        let mut parser = OscParser::new();
+        let input = b"output\x1b]133;D;0\x07";
+        let (clean, events) = parse_flat(&mut parser, input);
+        assert_eq!(clean, b"output");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OscEvent::CommandEnd { exit_code: 0 }));
+    }
+
+    #[test]
+    fn test_osc_parser_partial_sequence_split_across_calls() {
+        // Split the OSC sequence across two feed calls: first call ends in the
+        // middle of "133;C\x07", second call delivers the rest.
+        let mut parser = OscParser::new();
+
+        // Feed the escape and the start of the OSC body.
+        let first_half = b"\x1b]133;";
+        let (clean1, events1) = parse_flat(&mut parser, first_half);
+        // Nothing resolved yet — partial sequence is buffered.
+        assert!(clean1.is_empty());
+        assert!(events1.is_empty());
+
+        // Feed the remainder.
+        let second_half = b"C\x07trailing";
+        let (clean2, events2) = parse_flat(&mut parser, second_half);
+        assert_eq!(clean2, b"trailing");
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(events2[0], OscEvent::CommandStart));
+    }
+
+    #[test]
+    fn test_current_block_none_when_no_command_active() {
+        let engine = BlockEngine::new();
+        assert!(engine.current_block().is_none());
+    }
+
+    #[test]
+    fn test_current_block_some_while_command_running() {
+        let mut engine = BlockEngine::new();
+        engine.feed_output(b"\x1b]133;C\x07");
+        assert!(engine.current_block().is_some());
+        // Completing the command clears current.
+        engine.feed_output(b"\x1b]133;D;0\x07");
+        assert!(engine.current_block().is_none());
+    }
+
+    #[test]
+    fn test_block_preview_truncates_to_max_lines() {
+        let mut engine = BlockEngine::new();
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"line1\nline2\nline3\nline4\nline5\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        let block = &engine.completed_blocks()[0];
+        let preview = block.preview(3);
+        let lines: Vec<&str> = preview.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line1");
+        assert_eq!(lines[2], "line3");
+    }
+
+    #[test]
+    fn test_block_line_count() {
+        let mut engine = BlockEngine::new();
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"a\nb\nc\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        let block = &engine.completed_blocks()[0];
+        // Three newlines → line_count == 3.
+        assert_eq!(block.line_count(), 3);
+    }
+
+    #[test]
+    fn test_toggle_collapse_flips_state() {
+        let mut engine = BlockEngine::new();
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"out\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        let id = engine.completed_blocks()[0].id;
+        assert!(!engine.completed_blocks()[0].collapsed);
+
+        engine.toggle_collapse(id);
+        assert!(engine.completed_blocks()[0].collapsed);
+
+        engine.toggle_collapse(id);
+        assert!(!engine.completed_blocks()[0].collapsed);
+    }
+
+    #[test]
+    fn test_multiple_commands_produce_multiple_blocks() {
+        let mut engine = BlockEngine::new();
+
+        // First command.
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b]133;E;echo foo\x07");
+        engine.feed_output(b"foo\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        // Second command (non-zero exit).
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b]133;E;false\x07");
+        engine.feed_output(b"\x1b]133;D;1\x07");
+
+        let blocks = engine.completed_blocks();
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].command.as_deref(), Some("echo foo"));
+        assert_eq!(blocks[0].exit_code, Some(0));
+
+        assert_eq!(blocks[1].command.as_deref(), Some("false"));
+        assert_eq!(blocks[1].exit_code, Some(1));
     }
 }
