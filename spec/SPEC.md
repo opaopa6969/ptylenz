@@ -26,42 +26,6 @@ ptylenz はこの問題を、シェルのセッションを **ブロック (Bloc
 
 ptylenz は **PTY プロキシ** と **ratatui TUI オーバーレイ** の 2 つの主要コンポーネントで構成される。
 
-```
-ユーザーの端末 (ターミナルエミュレータ)
-        │ stdin
-        ▼
-┌──────────────────────────────────────────────────────┐
-│                    ptylenz プロセス                    │
-│                                                      │
-│  stdin ──→ handle_input() ──→ proxy.write_input()   │
-│                                     │                │
-│                              PTY master fd           │
-│                                     │                │
-│                             ┌───────────────┐        │
-│                             │   bash 子プロセス│        │
-│                             │  (PTY slave)   │        │
-│                             └───────────────┘        │
-│                                     │ stdout         │
-│                             proxy.read_output()      │
-│                                     │                │
-│                            BlockEngine.feed_output() │
-│                           ┌─────────┴──────────┐    │
-│                           │       OscParser     │    │
-│                           │  (5-state machine)  │    │
-│                           └──────────┬──────────┘    │
-│                     clean bytes      │ OSC events    │
-│                          │           │               │
-│                    stdout へ書き出し  ブロック蓄積     │
-│                    (Normal mode)    (Block History)  │
-│                                     │               │
-│                              ratatui TUI overlay     │
-│                              (Ctrl+] で表示)          │
-└──────────────────────────────────────────────────────┘
-        │ stdout
-        ▼
-ユーザーの端末 (ターミナルエミュレータ)
-```
-
 加えて、バックグラウンドスレッドが Claude Code の JSONL セッションログを監視し、`ClaudeEvent` を mpsc チャネル経由でメインループへ送る。メインループが `ingest_claude_event()` で BlockEngine へ注入することで、Shell ブロックと ClaudeTurn ブロックが時系列順に並列表示される。
 
 #### アーキテクチャ図 (Mermaid)
@@ -84,17 +48,17 @@ graph TB
             OSC["OSC 133 検出"]
         end
 
-        CLEAN["clean bytes\n→ stdout 書き出し"]
-        EVENTS["OSC events\n→ ブロック蓄積"]
-        HISTORY["Block History\n(Vec&lt;Block&gt;)"]
+        CLEAN["clean bytes<br/>→ stdout 書き出し"]
+        EVENTS["OSC events<br/>→ ブロック蓄積"]
+        HISTORY["Block History<br/>(Vec&lt;Block&gt;)"]
 
-        subgraph TUI["ratatui TUI overlay\n(Ctrl+] で表示)"]
+        subgraph TUI["ratatui TUI overlay<br/>(Ctrl+] で表示)"]
             LIST["List View"]
             DETAIL["Detail View"]
         end
 
         subgraph ClaudeFeeder["claude_feeder (background thread)"]
-            JSONL["~/.claude/projects/&lt;slug&gt;/*.jsonl\n400ms polling"]
+            JSONL["~/.claude/projects/&lt;slug&gt;/*.jsonl<br/>400ms polling"]
             MPSC["mpsc::Sender&lt;ClaudeEvent&gt;"]
         end
     end
@@ -149,50 +113,31 @@ graph TB
 
 ### 2.1 機能全体像
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Phase 1: PTY + OSC 133 + TUI 基本 (実装済み v0.1)  │
-│                                                     │
-│  ┌─────────────────┐  ┌──────────────────────────┐  │
-│  │  PTY Proxy       │  │  Block Engine             │  │
-│  │  - openpty/fork  │  │  - OscParser (5 states)   │  │
-│  │  - bash rcfile   │  │  - Block lifecycle         │  │
-│  │  - SIGWINCH      │  │  - vt100 shadow grid       │  │
-│  │  - polling       │  │  - search / export / pin  │  │
-│  └─────────────────┘  └──────────────────────────┘  │
-│                                                     │
-│  ┌─────────────────────────────────────────────┐   │
-│  │  TUI Overlay (ratatui)                       │   │
-│  │  - List View (j/k/g/G/Enter/v/y/e/p//)      │   │
-│  │  - Detail View (hjkl/v/Ctrl+v/y/Y)          │   │
-│  │  - Search (/, n/N)                           │   │
-│  │  - Clipboard (OSC 52 + xclip/pbcopy)         │   │
-│  └─────────────────────────────────────────────┘   │
-│                                                     │
-├─────────────────────────────────────────────────────┤
-│  Phase 2: Claude Code JSONL 統合 (実装済み v0.1)    │
-│                                                     │
-│  ┌─────────────────────────────────────────────┐   │
-│  │  claude_feeder                               │   │
-│  │  - ~/.claude/projects/<slug>/*.jsonl tail    │   │
-│  │  - 400ms polling (no inotify)                │   │
-│  │  - ClaudeEvent → BlockEngine                 │   │
-│  │  - tool_use サマリー表示                     │   │
-│  └─────────────────────────────────────────────┘   │
-│                                                     │
-├─────────────────────────────────────────────────────┤
-│  Phase 3: ブロックエンジン拡張 (計画中)              │
-│  - 正規表現検索                                     │
-│  - ブロック間 diff                                  │
-│  - 外部コマンドへのパイプ                           │
-│  - ブロック単位再実行                               │
-│                                                     │
-├─────────────────────────────────────────────────────┤
-│  Phase 4: vt100 高度化 (計画中)                     │
-│  - 256色/Truecolor の Detail View 転写             │
-│  - CJK 全角幅補正                                   │
-│  - ブロックリプレイ                                 │
-└─────────────────────────────────────────────────────┘
+```mermaid
+block-beta
+    columns 1
+
+    block:Phase1["Phase 1: PTY + OSC 133 + TUI 基本 (実装済み v0.1)"]
+        columns 2
+        PTYProxy["PTY Proxy<br/>- openpty/fork<br/>- bash rcfile<br/>- SIGWINCH<br/>- polling"]
+        BlockEngine["Block Engine<br/>- OscParser (5 states)<br/>- Block lifecycle<br/>- vt100 shadow grid<br/>- search / export / pin"]
+        TUIOverlay["TUI Overlay (ratatui)<br/>- List View (j/k/g/G/Enter/v/y/e/p//)<br/>- Detail View (hjkl/v/Ctrl+v/y/Y)<br/>- Search (/, n/N)<br/>- Clipboard (OSC 52 + xclip/pbcopy)"]:2
+    end
+
+    block:Phase2["Phase 2: Claude Code JSONL 統合 (実装済み v0.1)"]
+        columns 1
+        ClaudeFeeder["claude_feeder<br/>- ~/.claude/projects/&lt;slug&gt;/*.jsonl tail<br/>- 400ms polling (no inotify)<br/>- ClaudeEvent → BlockEngine<br/>- tool_use サマリー表示"]
+    end
+
+    block:Phase3["Phase 3: ブロックエンジン拡張 (計画中)"]
+        columns 1
+        Phase3Items["- 正規表現検索<br/>- ブロック間 diff<br/>- 外部コマンドへのパイプ<br/>- ブロック単位再実行"]
+    end
+
+    block:Phase4["Phase 4: vt100 高度化 (計画中)"]
+        columns 1
+        Phase4Items["- 256色/Truecolor の Detail View 転写<br/>- CJK 全角幅補正<br/>- ブロックリプレイ"]
+    end
 ```
 
 ### 2.2 Phase 1 詳細機能リスト
@@ -470,61 +415,24 @@ enum ParseState {
 
 #### 状態遷移図
 
-```
-                    ┌──────────────────────────────────┐
-                    │ その他バイト → pending            │
-                    ▼                                  │
-          ┌──────────────────┐                        │
-          │     Normal       │ ←──────────────────────┘
-          └──────────────────┘
-                    │ \x1b
-                    ▼
-          ┌──────────────────┐
-          │     Escape       │
-          └──────────────────┘
-          │ ]              │ その他
-          ▼                ▼ (\x1b + byte → pending, Normal)
- ┌──────────────────┐
- │    OscStart      │
- └──────────────────┘
-          │ any byte → buf
-          ▼
- ┌──────────────────┐
- │    OscBody       │ ←────── buf へ push
- └──────────────────┘
-    │ \x07 (BEL)     │ \x1b
-    ▼                ▼
-finish_osc()   finish_osc()
-    │                │
-    ▼                ▼
- Normal      ┌──────────────────┐
-             │  OscStSwallow    │
-             └──────────────────┘
-                  │ \      │ その他     │ \x1b
-                  ▼        ▼           ▼
-               Normal    Normal      Escape
-```
-
-#### OscParser 状態遷移図 (Mermaid)
-
 ```mermaid
 stateDiagram-v2
     [*] --> Normal
 
     Normal --> Escape : \x1b
-    Normal --> Normal : その他バイト\n(pending へ push)
+    Normal --> Normal : その他バイト<br/>(pending へ push)
 
     Escape --> OscStart : ]
-    Escape --> Normal : その他\n(\x1b + byte → pending)
+    Escape --> Normal : その他<br/>(\x1b + byte → pending)
 
-    OscStart --> OscBody : 任意バイト\n(buf へ push)
+    OscStart --> OscBody : 任意バイト<br/>(buf へ push)
 
-    OscBody --> OscBody : その他バイト\n(buf へ push)
-    OscBody --> Normal : \x07 (BEL)\nfinish_osc()
-    OscBody --> OscStSwallow : \x1b (ST 先頭)\nfinish_osc()
+    OscBody --> OscBody : その他バイト<br/>(buf へ push)
+    OscBody --> Normal : \x07 (BEL)<br/>finish_osc()
+    OscBody --> OscStSwallow : \x1b (ST 先頭)<br/>finish_osc()
 
     OscStSwallow --> Normal : \\ (ST 末尾を飲み込む)
-    OscStSwallow --> Normal : その他バイト\n(pending へ push)
+    OscStSwallow --> Normal : その他バイト<br/>(pending へ push)
     OscStSwallow --> Escape : \x1b
 ```
 
@@ -572,59 +480,17 @@ pub enum OscEvent {
 
 ブロックは BlockEngine の `current` フィールド (進行中) または `blocks` 配列 (完了) に存在する。
 
-```
-(存在しない)
-      │
-      │ OscEvent::CommandStart
-      │   → Block::new(next_id)
-      │   → vt_parser = Some(vt100::Parser::new(...))
-      │   → last_alt_snapshot = None
-      ▼
-┌────────────────────────────────────────────┐
-│  OPEN (current: Some(block))               │
-│                                            │
-│  Bytes 受信:                               │
-│    block.output.extend(bytes)              │
-│    block.cached_line_count += newlines     │
-│    vt_parser.process(bytes)                │
-│    if alt_screen active:                   │
-│      last_alt_snapshot = snap              │
-│      block.rendered_text = Some(snap)      │
-│                                            │
-│  CommandText(cmd) 受信:                    │
-│    block.command = Some(cmd)               │
-└────────────────────────────────────────────┘
-      │
-      │ OscEvent::CommandEnd(exit_code) または PromptStart
-      │   → block.exit_code = Some(exit_code)
-      │   → block.ended_at = Some(now)
-      │   → finalize_rendered_text()
-      │   → if line_count > 50: collapsed = true
-      │   → blocks.push(block)
-      │   → vt_parser = None
-      │   → last_alt_snapshot = None
-      ▼
-┌────────────────────────────────────────────┐
-│  CLOSED (blocks: Vec<Block>)               │
-│                                            │
-│  toggle_collapse(id) で collapsed 変更可    │
-│  toggle_pin(id) で pinned 変更可           │
-└────────────────────────────────────────────┘
-```
-
-#### ブロックライフサイクル図 (Mermaid)
-
 ```mermaid
 stateDiagram-v2
-    [*] --> OPEN : OscEvent::CommandStart\nBlock::new(next_id)\nvt_parser = Some(...)
+    [*] --> OPEN : OscEvent::CommandStart<br/>Block::new(next_id)<br/>vt_parser = Some(...)
 
-    OPEN --> OPEN : Bytes 受信\nblock.output.extend(bytes)\ncached_line_count += newlines\nvt_parser.process(bytes)\n[alt_screen] → last_alt_snapshot 更新
+    OPEN --> OPEN : Bytes 受信<br/>block.output.extend(bytes)<br/>cached_line_count += newlines<br/>vt_parser.process(bytes)<br/>[alt_screen] → last_alt_snapshot 更新
 
-    OPEN --> OPEN : CommandText(cmd) 受信\nblock.command = Some(cmd)
+    OPEN --> OPEN : CommandText(cmd) 受信<br/>block.command = Some(cmd)
 
-    OPEN --> CLOSED : CommandEnd(exit_code)\nまたは PromptStart\nexit_code 設定 / ended_at = now\nfinalize_rendered_text()\nblocks.push(block)\nvt_parser = None
+    OPEN --> CLOSED : CommandEnd(exit_code)<br/>または PromptStart<br/>exit_code 設定 / ended_at = now<br/>finalize_rendered_text()<br/>blocks.push(block)<br/>vt_parser = None
 
-    CLOSED --> CLOSED : toggle_collapse(id)\ntoggle_pin(id)
+    CLOSED --> CLOSED : toggle_collapse(id)<br/>toggle_pin(id)
 
     note right of OPEN
         line_count > 50 の場合
@@ -678,28 +544,26 @@ enum PtylenzView {
 
 #### モード遷移
 
-```
-Normal
-  │ Ctrl+] (0x1d)
-  │   → enter_ptylenz()
-  │     → execute!(EnterAlternateScreen)
-  │     → Terminal::new()
-  │     → term.hide_cursor()
-  ▼
-Ptylenz::List
-  │         │               │
-  │ Ctrl+]  │ v (ブロック    │ / (検索
-  │ q / Esc │  選択中)       │  モード)
-  │         ▼               ▼
-  │  Ptylenz::Detail   search_input = Some("")
-  │    │                    │ Enter → 実行 / Esc → キャンセル
-  │    │ q / Esc(選択なし)   └──→ search_input = None
-  │    └──→ List             (last_search 更新)
-  │
-  ▼ leave_ptylenz()
-    → term.show_cursor()
-    → execute!(LeaveAlternateScreen)
-Normal
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+
+    Normal --> PtylenzList : Ctrl+]<br/>enter_ptylenz()<br/>EnterAlternateScreen<br/>hide_cursor()
+
+    PtylenzList --> PtylenzDetail : v (ブロック選択中)
+    PtylenzList --> SearchInput : / (検索モード)
+    PtylenzList --> Normal : Ctrl+] / q / Esc<br/>leave_ptylenz()<br/>show_cursor()<br/>LeaveAlternateScreen
+
+    PtylenzDetail --> PtylenzList : q / Esc (選択なし)
+    PtylenzDetail --> Normal : Ctrl+]<br/>leave_ptylenz()
+
+    SearchInput --> PtylenzList : Enter (last_search 更新)<br/>search_input = None
+    SearchInput --> PtylenzList : Esc<br/>search_input = None
+    SearchInput --> Normal : Ctrl+]<br/>leave_ptylenz()
+
+    PtylenzList : Ptylenz::List
+    PtylenzDetail : Ptylenz::Detail
+    SearchInput : search_input = Some("")
 ```
 
 `Ctrl+]` は **どのサブ状態からでも** `leave_ptylenz()` を呼ぶ。Detail View 中、検索入力中であっても即座に Normal モードへ戻る。
@@ -710,26 +574,23 @@ Normal
 
 ### 4.4 検索ステートマシン
 
-```
-(last_search: None, search_input: None)
-    │ / キー
-    ▼
-(search_input: Some(""))
-    │ 文字入力 → query 更新
-    │ Backspace → query から末尾削除
-    │ Esc → search_input = None (last_search は変えない)
-    │ Enter
-    │   → results = proxy.blocks().search(query)
-    │   → last_search = Some(SearchState { query, results, result_index: 0 })
-    │   → selected = 最初のヒットのブロックインデックス
-    │   → search_input = None
-    ▼
-(last_search: Some(state), search_input: None)
-    │ n → result_index = (result_index + 1) % len
-    │ N → result_index = (result_index - 1 + len) % len
-    │     selected = ヒットのブロックインデックス
-    │ / → 新しい search_input を開始 (last_search は保持)
-    └── q / Esc / Ctrl+] → Normal モードへ (last_search は破棄)
+```mermaid
+stateDiagram-v2
+    [*] --> Idle : 初期状態<br/>(last_search: None, search_input: None)
+
+    Idle --> Typing : / キー<br/>search_input = Some("")
+
+    Typing --> Typing : 文字入力 → query 更新<br/>Backspace → 末尾削除
+    Typing --> Idle : Esc<br/>search_input = None<br/>(last_search 保持)
+    Typing --> HasResults : Enter<br/>results = blocks.search(query)<br/>last_search = Some(SearchState)<br/>selected = 最初のヒット<br/>search_input = None
+
+    HasResults --> HasResults : n → result_index + 1<br/>N → result_index - 1<br/>selected = ヒットのブロック
+    HasResults --> Typing : /<br/>新しい search_input を開始<br/>(last_search 保持)
+    HasResults --> [*] : q / Esc / Ctrl+]<br/>last_search 破棄<br/>Normal モードへ
+
+    Idle : Idle<br/>(last_search: None, search_input: None)
+    Typing : Typing<br/>(search_input: Some(query))
+    HasResults : HasResults<br/>(last_search: Some(state), search_input: None)
 ```
 
 ---
@@ -782,13 +643,13 @@ sequenceDiagram
     participant User as ユーザー
     participant ptylenz as ptylenz (main loop)
     participant bash as bash 子プロセス
-    participant feeder as claude_feeder\n(background thread)
-    participant jsonl as ~/.claude/projects/\n<slug>/*.jsonl
+    participant feeder as claude_feeder (background thread)
+    participant jsonl as ~/.claude/projects/&lt;slug&gt;/*.jsonl
 
     Note over ptylenz,bash: 起動時: ラッパー rcfile を $TMPDIR に書き出し
     ptylenz->>bash: execvp("bash", ["--rcfile", "/tmp/ptylenz-rc-<PID>.sh", "-i"])
     bash-->>bash: source ~/.bashrc
-    bash-->>bash: PROMPT_COMMAND = __ptylenz_precmd\n(OSC 133 上書き注入)
+    bash-->>bash: PROMPT_COMMAND = __ptylenz_precmd<br/>(OSC 133 上書き注入)
 
     Note over feeder,jsonl: バックグラウンドスレッド起動
     ptylenz->>feeder: spawn_watcher(cwd, tx)
@@ -808,11 +669,11 @@ sequenceDiagram
     bash-->>ptylenz: コマンド出力バイト列
     ptylenz->>ptylenz: BlockEngine: output 蓄積
 
-    bash-->>ptylenz: PROMPT_COMMAND 実行:\nOSC 133;D;0 (CommandEnd, exit=0)\nOSC 133;E;ls -la (CommandText)
-    ptylenz->>ptylenz: BlockEngine: Block 完了\ncommand = "ls -la"
+    bash-->>ptylenz: PROMPT_COMMAND 実行:<br/>OSC 133;D;0 (CommandEnd, exit=0)<br/>OSC 133;E;ls -la (CommandText)
+    ptylenz->>ptylenz: BlockEngine: Block 完了<br/>command = "ls -la"
 
     Note over ptylenz: ClaudeEvent 受信 (mpsc)
-    ptylenz->>ptylenz: ingest_claude_event()\n→ ClaudeTurn ブロック追加
+    ptylenz->>ptylenz: ingest_claude_event()<br/>→ ClaudeTurn ブロック追加
 ```
 
 ### 5.2 CommandText の遅延帰属 (Late Attribution)
