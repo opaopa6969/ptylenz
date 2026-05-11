@@ -44,20 +44,23 @@ So to give output structure, we have to sit on the master side of the PTY. That'
 
 ### Data flow
 
-```
-┌──────────────────────────────────────────────┐
-│ ptylenz process                              │
-│                                              │
-│  Terminal ←→ [PTY proxy] ←→ [PTY] ←→ bash    │
-│                  ↓                     ↓     │
-│            [Block Engine]         fork/exec  │
-│                  ↓                     ↓     │
-│            [TUI Renderer]         commands   │
-│                                              │
-│        [Claude JSONL feeder] ────────┐       │
-│              ↓                       ↓       │
-│        [Block Engine] ←──── claude turns     │
-└──────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Term[Terminal]
+    subgraph Ptylenz["ptylenz process"]
+        Proxy[PTY proxy]
+        PTY[PTY]
+        Block[Block Engine]
+        TUI[TUI Renderer]
+        Feeder[Claude JSONL feeder]
+    end
+    Bash["bash<br/>(fork/exec, commands)"]
+    Term <--> Proxy
+    Proxy <--> PTY
+    PTY <--> Bash
+    Proxy --> Block
+    Block --> TUI
+    Feeder -- "claude turns" --> Block
 ```
 
 The PTY proxy relays all I/O. Bash emits OSC markers around each command, and ptylenz uses those to slice the byte stream into blocks. In parallel a feeder thread tails Claude Code's session JSONL log and ingests user/assistant turns as sibling blocks.
@@ -79,12 +82,15 @@ The bash integration emits these via `PROMPT_COMMAND` + `PS0` + `PS1`. We delibe
 
 The whole UI follows a single rule: **Normal mode is invisible**. `Ctrl+]` is the one and only boundary key.
 
-```
-Normal mode: every keystroke goes straight to bash
-                ↓ Ctrl+]
-Ptylenz mode: ratatui overlay
-              ├─ List view: blocks
-              └─ Detail view: one block, full screen, cursor + vim-style visual
+```mermaid
+flowchart TB
+    N["Normal mode<br/>every keystroke goes straight to bash"]
+    P["Ptylenz mode (ratatui overlay)"]
+    L["List view: blocks"]
+    D["Detail view: one block, full screen, cursor + vim-style visual"]
+    N -- "Ctrl+]" --> P
+    P --> L
+    P --> D
 ```
 
 ### Wrap-free copy

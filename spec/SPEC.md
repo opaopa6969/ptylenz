@@ -994,10 +994,12 @@ loop {
 
 ### 7.1 レンダリングバックエンド
 
-```
-ratatui (0.29)
-  └── CrosstermBackend<io::Stdout>
-        └── crossterm::execute!(EnterAlternateScreen / LeaveAlternateScreen)
+```mermaid
+flowchart TB
+    R["ratatui (0.29)"]
+    CB["CrosstermBackend&lt;io::Stdout&gt;"]
+    CE["crossterm::execute!<br/>(EnterAlternateScreen / LeaveAlternateScreen)"]
+    R --> CB --> CE
 ```
 
 alt-screen は Ptylenz モードの間のみ有効。Normal モードへ戻ると `LeaveAlternateScreen` で元のターミナル表示 (シェルの scrollback を含む) が復元される。

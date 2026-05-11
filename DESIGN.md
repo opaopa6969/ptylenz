@@ -63,13 +63,18 @@ Concretely, using Claude Code / Codex inside tmux is brutal:
 
 This is the central insight:
 
-```
-bash (pid=100)
-  ├─ fork()
-  │    └─ child (pid=101) → exec("claude-code")
-  │         ├─ stdout → PTY → terminal emulator
-  │         └─ stderr → PTY → terminal emulator
-  └─ wait(101)  ← bash is sleeping here
+```mermaid
+flowchart TB
+    Bash["bash (pid=100)"]
+    Fork["fork()"]
+    Child["child (pid=101)<br/>exec(&quot;claude-code&quot;)"]
+    Term[terminal emulator]
+    Wait["wait(101)<br/>← bash is sleeping here"]
+    Bash --> Fork
+    Bash --> Wait
+    Fork --> Child
+    Child -- "stdout → PTY" --> Term
+    Child -- "stderr → PTY" --> Term
 ```
 
 **bash is not in the data path.** claude-code's output goes through the PTY (kernel layer) directly to the terminal. bash is just blocked in `wait()`, watching nothing.
@@ -121,3 +126,74 @@ Two siblings in a `lenz` family with the same design philosophy.
 - Structured pipelines (nushell-style)
 - Semantic analysis of AI output (diff detection, file-change summaries)
 - Session persistence (replace tmux for that purpose)
+
+## Appendix: optional dependencies (feature gates)
+
+Playbook for opting into heavy or quality-only dependencies. C solves this with `#ifdef`; Rust uses **Cargo features + `#[cfg(...)]`** — same idea, declared in `Cargo.toml` instead of passed as compiler flags.
+
+### Minimal example
+
+`Cargo.toml`:
+
+```toml
+[features]
+default = []
+grapheme-truncate = ["dep:unicode-segmentation"]
+
+[dependencies]
+unicode-segmentation = { version = "1", optional = true }
+```
+
+- `optional = true` — crate is only linked when the feature is on.
+- `dep:unicode-segmentation` — "enabling this feature pulls in the same-named crate" (Rust 1.60+ syntax).
+
+Code side:
+
+```rust
+#[cfg(feature = "grapheme-truncate")]
+use unicode_segmentation::UnicodeSegmentation;
+
+fn truncate(s: &str, max: usize) -> String {
+    #[cfg(feature = "grapheme-truncate")]
+    { /* grapheme-aware truncation */ }
+    #[cfg(not(feature = "grapheme-truncate"))]
+    { /* codepoint-boundary fallback */ }
+}
+```
+
+Build:
+
+```bash
+cargo build                                    # defaults only
+cargo build --features grapheme-truncate       # enable feature
+cargo build --no-default-features              # turn off default features too
+```
+
+### Mapping to C
+
+| C | Rust |
+|---|------|
+| `#ifdef FOO` | `#[cfg(feature = "foo")]` |
+| `-DFOO` | `--features foo` |
+| `#ifndef FOO` | `#[cfg(not(feature = "foo"))]` |
+| conditional `#include` | `optional = true` in `Cargo.toml` |
+
+`#[cfg(...)]` isn't limited to features:
+
+```rust
+#[cfg(target_os = "linux")]
+#[cfg(target_arch = "x86_64")]
+#[cfg(debug_assertions)]    // debug builds only
+#[cfg(test)]                // cargo test only
+#[cfg(all(unix, not(target_os = "macos")))]
+```
+
+Attaches to functions, modules, struct fields, use statements — fine-grained.
+
+### When to feature-gate in ptylenz
+
+- **Gate it**: heavy dependencies / dependencies with alternatives (e.g. clipboard backends) / platform-specific impls.
+- **Don't gate**: small, always-useful deps — default-on with no branching is easier to maintain.
+- Feature combinations blow up the test matrix, so **keep the number small**.
+
+Current candidates: none. `unicode-segmentation` (ZWJ / grapheme cluster support) was added unconditionally as a default dependency — small enough that a feature gate would be overkill.

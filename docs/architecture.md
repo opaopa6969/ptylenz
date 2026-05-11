@@ -12,32 +12,30 @@ For the design rationale see [DESIGN.md](../DESIGN.md).
 
 ## System overview
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ ptylenz process                                             │
-│                                                             │
-│  Terminal stdin ──► [PTY proxy] ──► PTY master fd           │
-│                                          │                  │
-│  Terminal stdout ◄── (clean bytes) ◄─────┤                  │
-│                                          │                  │
-│                                   [Block Engine]            │
-│                                          │                  │
-│                                   [vt100 shadow]            │
-│                                          │                  │
-│                             ┌────────────┘                  │
-│                             ▼                               │
-│                      [ratatui TUI overlay]                  │
-│                        (alt-screen, on demand)              │
-│                                                             │
-│  [Claude feeder thread] ──► Block Engine                    │
-│    (polls JSONL log)                                        │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                    PTY slave fd (kernel)
-                              │
-                    bash (child process)
-                              │
-                    fork/exec → commands
+```mermaid
+flowchart TB
+    Stdin[Terminal stdin]
+    Stdout[Terminal stdout]
+    subgraph Ptylenz["ptylenz process"]
+        Proxy[PTY proxy]
+        Master[PTY master fd]
+        Block[Block Engine]
+        VT100[vt100 shadow]
+        TUI["ratatui TUI overlay<br/>(alt-screen, on demand)"]
+        Feeder["Claude feeder thread<br/>(polls JSONL log)"]
+    end
+    Slave[PTY slave fd, kernel]
+    Bash["bash (child process)"]
+    Commands["fork/exec → commands"]
+    Stdin --> Proxy --> Master
+    Master -- "clean bytes" --> Stdout
+    Master --> Block
+    Block --> VT100
+    VT100 --> TUI
+    Feeder --> Block
+    Master --> Slave
+    Slave --> Bash
+    Bash --> Commands
 ```
 
 There are four source files:
@@ -89,29 +87,18 @@ Block detection requires knowing exactly where each command's output begins and 
 | `\e]133;D;N\a` | Command finished, exit code N |
 | `\e]133;E;text\a` | Command text (block title) |
 
-### 5-state machine
-
-```
-Normal
-  │ \x1b
-  ▼
-Escape
-  │ ']'          │ other → emit(\x1b + byte) → Normal
-  ▼
-OscStart
-  │ (any byte)
-  ▼
-OscBody ──────────────────────────────────────────────────────►
-  │ \x07 (BEL)  →  decode_osc(buf)                            │
-  │               OSC 133 → emit Event, → Normal               │
-  │               other   → re-emit original bytes, → Normal   │
-  │ \x1b (ESC)  →  decode_osc(buf)                            │
-                  OSC 133 → emit Event, → OscStSwallow
-                  other   → re-emit original bytes, → Normal
-
-OscStSwallow
-  │ '\\' → Normal   (consume the ST terminator)
-  │ other → emit byte, → Normal
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+    Normal --> Escape: \\x1b
+    Escape --> OscStart: ']'
+    Escape --> Normal: other (emit \\x1b + byte)
+    OscStart --> OscBody: any byte
+    OscBody --> Normal: \\x07 BEL & decode<br/>OSC 133 → emit Event<br/>other → re-emit
+    OscBody --> OscStSwallow: \\x1b ESC & decode<br/>OSC 133 → emit Event
+    OscBody --> Normal: \\x1b ESC & other<br/>re-emit original bytes
+    OscStSwallow --> Normal: '\\\\' (consume ST terminator)
+    OscStSwallow --> Normal: other (emit byte)
 ```
 
 ### Passthrough guarantee
@@ -128,16 +115,13 @@ Only `\e]133;*` sequences are consumed. All other OSC sequences — `\e]0;title\
 
 ### Block lifecycle
 
-```
-OSC 133;C  →  open new Block (self.current = Some(block))
-raw bytes  →  append to current.output; update cached_line_count;
-               tee into vt100 shadow (see below)
-OSC 133;E  →  set current.command (or patch last closed block if 133;E
-               arrives after 133;D — bash emits it from PROMPT_COMMAND)
-OSC 133;D  →  close current: set exit_code, ended_at, finalize rendered_text;
-               auto-collapse if line_count > 50; push to self.blocks
-OSC 133;A  →  close current if any (handles prompt-without-D edge cases)
-```
+| Event | Action |
+|---|---|
+| `OSC 133;C` | open new Block (`self.current = Some(block)`) |
+| raw bytes | append to `current.output`; update `cached_line_count`; tee into vt100 shadow (see below) |
+| `OSC 133;E` | set `current.command` (or patch last closed block if `133;E` arrives after `133;D` — bash emits it from `PROMPT_COMMAND`) |
+| `OSC 133;D` | close current: set `exit_code`, `ended_at`, finalize `rendered_text`; auto-collapse if `line_count > 50`; push to `self.blocks` |
+| `OSC 133;A` | close current if any (handles prompt-without-`D` edge cases) |
 
 ### cached_line_count
 
@@ -198,13 +182,19 @@ Mode::Ptylenz { selected, view, search_input, last_search, status_message }
 
 ### Event loop
 
-```
-Poller::wait(80ms)
-  ├─ PTY_KEY readable → proxy.read_output() → optionally write to stdout
-  ├─ STDIN_KEY readable → handle_input()
-  └─ SIGWINCH flag → resize
-claude_rx.try_recv() → ingest_claude_event()  (drains before each poll)
-if Ptylenz mode → draw_ptylenz()
+```mermaid
+flowchart TB
+    Poll["Poller::wait(80ms)"]
+    PTY["PTY_KEY readable<br/>proxy.read_output()<br/>(optionally write to stdout)"]
+    Stdin["STDIN_KEY readable<br/>handle_input()"]
+    Resize["SIGWINCH flag<br/>resize"]
+    Claude["claude_rx.try_recv()<br/>ingest_claude_event()<br/>(drains before each poll)"]
+    Draw["if Ptylenz mode → draw_ptylenz()"]
+    Claude --> Poll
+    Poll --> PTY
+    Poll --> Stdin
+    Poll --> Resize
+    Poll --> Draw
 ```
 
 The 80 ms timeout keeps the UI responsive even when no I/O arrives (e.g., the user is viewing a block and the shell is idle).

@@ -12,32 +12,30 @@
 
 ## システム全体図
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│ ptylenz プロセス                                             │
-│                                                             │
-│  ターミナル stdin ──► [PTY プロキシ] ──► PTY master fd       │
-│                                              │              │
-│  ターミナル stdout ◄── (クリーンバイト) ◄────┤              │
-│                                              │              │
-│                                       [ブロックエンジン]    │
-│                                              │              │
-│                                       [vt100 シャドウ]      │
-│                                              │              │
-│                                 ┌────────────┘              │
-│                                 ▼                           │
-│                          [ratatui TUI オーバーレイ]         │
-│                           (alt-screen、要求時のみ)          │
-│                                                             │
-│  [Claude フィーダスレッド] ──► ブロックエンジン              │
-│    (JSONL ログをポーリング)                                  │
-└─────────────────────────────────────────────────────────────┘
-                                  │
-                        PTY slave fd (カーネル)
-                                  │
-                        bash (子プロセス)
-                                  │
-                        fork/exec → コマンド群
+```mermaid
+flowchart TB
+    Stdin[ターミナル stdin]
+    Stdout[ターミナル stdout]
+    subgraph Ptylenz["ptylenz プロセス"]
+        Proxy[PTY プロキシ]
+        Master[PTY master fd]
+        Block[ブロックエンジン]
+        VT100[vt100 シャドウ]
+        TUI["ratatui TUI オーバーレイ<br/>(alt-screen、要求時のみ)"]
+        Feeder["Claude フィーダスレッド<br/>(JSONL ログをポーリング)"]
+    end
+    Slave["PTY slave fd (カーネル)"]
+    Bash["bash (子プロセス)"]
+    Commands["fork/exec → コマンド群"]
+    Stdin --> Proxy --> Master
+    Master -- "クリーンバイト" --> Stdout
+    Master --> Block
+    Block --> VT100
+    VT100 --> TUI
+    Feeder --> Block
+    Master --> Slave
+    Slave --> Bash
+    Bash --> Commands
 ```
 
 ソースファイル構成:
@@ -91,27 +89,18 @@
 
 ### 5 状態機械
 
-```
-Normal
-  │ \x1b
-  ▼
-Escape
-  │ ']'          │ その他 → emit(\x1b + byte) → Normal
-  ▼
-OscStart
-  │ (任意バイト)
-  ▼
-OscBody ──────────────────────────────────────────────────────►
-  │ \x07 (BEL)  →  decode_osc(buf)                            │
-  │               OSC 133 → Event を emit、→ Normal            │
-  │               それ以外 → 元のバイトを再 emit、→ Normal      │
-  │ \x1b (ESC)  →  decode_osc(buf)
-                  OSC 133 → Event を emit、→ OscStSwallow
-                  それ以外 → 元のバイトを再 emit、→ Normal
-
-OscStSwallow
-  │ '\\' → Normal   (ST ターミネータを消費)
-  │ その他 → byte を emit → Normal
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+    Normal --> Escape: \\x1b
+    Escape --> OscStart: ']'
+    Escape --> Normal: その他 (emit \\x1b + byte)
+    OscStart --> OscBody: 任意バイト
+    OscBody --> Normal: \\x07 BEL & decode<br/>OSC 133 → Event emit<br/>その他 → 再 emit
+    OscBody --> OscStSwallow: \\x1b ESC & decode<br/>OSC 133 → Event emit
+    OscBody --> Normal: \\x1b ESC & その他<br/>元のバイトを再 emit
+    OscStSwallow --> Normal: '\\\\' (ST ターミネータを消費)
+    OscStSwallow --> Normal: その他 (byte を emit)
 ```
 
 ### パススルー保証
@@ -128,16 +117,13 @@ OscStSwallow
 
 ### ブロックのライフサイクル
 
-```
-OSC 133;C  →  新 Block を開く (self.current = Some(block))
-生バイト    →  current.output に追記; cached_line_count を更新;
-               vt100 シャドウにも tee (下記参照)
-OSC 133;E  →  current.command をセット (133;E が 133;D の後に来る場合は
-               最後に閉じたブロックにパッチ — bash は PROMPT_COMMAND から発行)
-OSC 133;D  →  current を閉じる: exit_code・ended_at をセット、rendered_text を確定;
-               line_count > 50 なら自動折り畳み; self.blocks に追加
-OSC 133;A  →  current が存在すれば閉じる (D なしプロンプトエッジケース対応)
-```
+| イベント | 動作 |
+|---|---|
+| `OSC 133;C` | 新 Block を開く (`self.current = Some(block)`) |
+| 生バイト | `current.output` に追記; `cached_line_count` を更新; vt100 シャドウにも tee (下記参照) |
+| `OSC 133;E` | `current.command` をセット (`133;E` が `133;D` の後に来る場合は最後に閉じたブロックにパッチ — bash は `PROMPT_COMMAND` から発行) |
+| `OSC 133;D` | current を閉じる: `exit_code`・`ended_at` をセット、`rendered_text` を確定; `line_count > 50` なら自動折り畳み; `self.blocks` に追加 |
+| `OSC 133;A` | current が存在すれば閉じる (`D` なしプロンプトエッジケース対応) |
 
 ### cached_line_count
 
@@ -198,13 +184,19 @@ Mode::Ptylenz { selected, view, search_input, last_search, status_message }
 
 ### イベントループ
 
-```
-Poller::wait(80ms)
-  ├─ PTY_KEY 読み取り可能 → proxy.read_output() → 必要なら stdout へ書き出し
-  ├─ STDIN_KEY 読み取り可能 → handle_input()
-  └─ SIGWINCH フラグ → リサイズ
-claude_rx.try_recv() → ingest_claude_event()  (各 poll 前にドレイン)
-Ptylenz モードなら → draw_ptylenz()
+```mermaid
+flowchart TB
+    Poll["Poller::wait(80ms)"]
+    PTY["PTY_KEY 読み取り可能<br/>proxy.read_output()<br/>(必要なら stdout へ書き出し)"]
+    Stdin["STDIN_KEY 読み取り可能<br/>handle_input()"]
+    Resize["SIGWINCH フラグ<br/>リサイズ"]
+    Claude["claude_rx.try_recv()<br/>ingest_claude_event()<br/>(各 poll 前にドレイン)"]
+    Draw["Ptylenz モードなら → draw_ptylenz()"]
+    Claude --> Poll
+    Poll --> PTY
+    Poll --> Stdin
+    Poll --> Resize
+    Poll --> Draw
 ```
 
 80 ms タイムアウトにより、I/O が発生しないとき (ブロックを閲覧中でシェルがアイドル状態のとき) も UI がレスポンシブに保たれる。
