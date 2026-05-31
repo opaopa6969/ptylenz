@@ -15,7 +15,7 @@ use nix::unistd::{self, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use tempfile::NamedTempFile;
 
 use crate::block::{BlockEngine, OscEvent};
 
@@ -57,10 +57,19 @@ pub struct PtyProxy {
 impl PtyProxy {
     /// Spawn a child shell inside a new PTY, with shell integration.
     pub fn spawn(shell_path: &str) -> Result<Self> {
+        // Detect whether the requested shell is bash so we can pass bash-specific
+        // flags.  Only the final path component is checked so that paths like
+        // /usr/local/bin/bash, /opt/homebrew/bin/bash, etc. all match.
+        let is_bash = std::path::Path::new(shell_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n == "bash");
+
         // Write shell integration to a temp rcfile that also sources user's ~/.bashrc.
         // Using --rcfile with a wrapper preserves the user's bash environment while
         // letting us inject the OSC 133 markers we need for block detection.
-        let rcfile = write_bash_rcfile()?;
+        // Only done for bash; other shells don't support --rcfile.
+        let rcfile = if is_bash { Some(write_bash_rcfile()?) } else { None };
 
         // Create PTY pair with the real terminal's size baked in. Without this
         // the kernel hands us 0×0 (or 80×24 on some platforms) and any child
@@ -92,16 +101,50 @@ impl PtyProxy {
                 std::env::set_var("PTYLENZ", "1");
                 std::env::set_var("PTYLENZ_VERSION", env!("CARGO_PKG_VERSION"));
 
-                let shell = CString::new(shell_path).unwrap();
-                let rcfile_path = CString::new(rcfile.to_string_lossy().as_bytes()).unwrap();
-                let args = [
-                    shell.clone(),
-                    CString::new("--rcfile").unwrap(),
-                    rcfile_path,
-                    CString::new("-i").unwrap(),
-                ];
+                // CString::new returns Err if the input contains a NUL byte.
+                // Rather than unwrap() — which would panic on adversarial input
+                // or unusual environment values — propagate the error and exit
+                // with a diagnostic status code so the parent sees a clean failure
+                // instead of an unexpected panic in the child.
+                let shell = match CString::new(shell_path) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("ptylenz: shell path contains NUL byte");
+                        std::process::exit(126);
+                    }
+                };
 
-                unistd::execvp(&shell, &args).ok();
+                // Build the argument list depending on the shell.  bash accepts
+                // --rcfile to load our integration script; other shells (zsh,
+                // fish, sh, …) do not understand that flag and would fail to
+                // start.
+                if is_bash {
+                    if let Some(ref tmp) = rcfile {
+                        let rcfile_cstr = match CString::new(tmp.path().as_os_str().as_encoded_bytes()) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                eprintln!("ptylenz: rcfile path contains NUL byte");
+                                std::process::exit(126);
+                            }
+                        };
+                        let rcfile_flag = CString::new("--rcfile").expect("static string");
+                        let interactive_flag = CString::new("-i").expect("static string");
+                        let args = [shell.clone(), rcfile_flag, rcfile_cstr, interactive_flag];
+                        // Keep `tmp` alive until after exec so the file exists
+                        // when bash opens it.  execvp replaces the process image,
+                        // so the NamedTempFile destructor never runs in this
+                        // branch — that is intentional: bash will read the file
+                        // and the OS reclaims it when all handles are closed.
+                        let _ = &tmp;
+                        unistd::execvp(&shell, &args).ok();
+                    } else {
+                        unistd::execvp(&shell, &[shell.clone()]).ok();
+                    }
+                } else {
+                    // For non-bash shells just exec the shell directly without
+                    // any bash-specific flags.
+                    unistd::execvp(&shell, &[shell.clone()]).ok();
+                }
                 std::process::exit(127);
             }
             ForkResult::Parent { child } => {
@@ -204,10 +247,27 @@ fn query_winsize() -> Option<Winsize> {
 }
 
 /// Write a wrapper rcfile for bash that sources the user's ~/.bashrc then
-/// installs our OSC 133 emitters. Returns the path to the tempfile.
-fn write_bash_rcfile() -> Result<PathBuf> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("ptylenz-rc-{}.sh", std::process::id()));
+/// installs our OSC 133 emitters.
+///
+/// Returns a `NamedTempFile` so that:
+/// - the kernel assigns a unique, unpredictable path (no PID-based guessing),
+/// - the file is created with mode 0600 (no world-readable leak of the script),
+/// - the caller can keep the `NamedTempFile` alive as long as needed; when it
+///   is dropped the file is deleted automatically.
+fn write_bash_rcfile() -> Result<NamedTempFile> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("ptylenz-rc-")
+        .suffix(".sh")
+        .tempfile()
+        .context("create temp rcfile")?;
+
+    // Tighten permissions to 0600 — the file holds no secrets but is
+    // world-readable by default on some systems, and there is no reason
+    // for other users to inspect the generated integration script.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))
+        .context("set rcfile permissions")?;
 
     let contents = format!(
         "# ptylenz wrapper rcfile — auto-generated, safe to delete\n\
@@ -216,11 +276,9 @@ fn write_bash_rcfile() -> Result<PathBuf> {
         BASH_INTEGRATION
     );
 
-    let mut f = std::fs::File::create(&path)
-        .with_context(|| format!("create rcfile {:?}", path))?;
-    f.write_all(contents.as_bytes())
+    tmp.write_all(contents.as_bytes())
         .context("write rcfile contents")?;
-    Ok(path)
+    Ok(tmp)
 }
 
 #[cfg(test)]
