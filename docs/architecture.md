@@ -247,7 +247,7 @@ Polling is used instead of `inotify`/`kqueue` because ptylenz often runs over SS
 
 ### notify crate
 
-`notify = "6"` appears in `Cargo.toml` but is not used in the current implementation. See [docs/decisions/notify-dead-dep.md](decisions/notify-dead-dep.md).
+The `notify` filesystem-watch crate was scaffolded in early but never used — the feeder polls instead (see above). It has since been removed from `Cargo.toml`; the rationale, and how to reintroduce it for a future local-only mode, is recorded in [docs/decisions/notify-dead-dep.md](decisions/notify-dead-dep.md).
 
 ### ClaudeEvent ingestion
 
@@ -305,4 +305,5 @@ The `PROMPT_COMMAND` assignment overwrites any existing value. See [docs/decisio
 | `serde + serde_json 1` | JSONL decoding (Claude feeder) and JSON export |
 | `anyhow 1` | error propagation |
 | `chrono 0.4` | block timestamps |
-| `notify 6` | **unused** — kept for future inotify/kqueue path; see decisions/ |
+
+> The `notify` crate was scaffolded early but never used and has been removed; see [decisions/notify-dead-dep.md](decisions/notify-dead-dep.md).

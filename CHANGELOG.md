@@ -84,12 +84,12 @@ ptylenz uses [Semantic Versioning](https://semver.org/).
 - `install.sh` for source installs via `cargo install --path . --force`
 
 **Documentation**
-- `README.md` / `README-ja.md` — project overview, install, keybindings, architecture summary
+- `README.md` / `README.ja.md` — project overview, install, keybindings, architecture summary
 - `CHANGELOG.md` — this file
 - `docs/architecture.md` / `docs/architecture-ja.md` — component deep-dive
 - `docs/getting-started.md` / `docs/getting-started-ja.md` — install + first run
 - `docs/shell-integration.md` / `docs/shell-integration-ja.md` — OSC 133 setup, per-shell reference
-- `docs/decisions/notify-dead-dep.md` — why `notify` is in `Cargo.toml` but unused
+- `docs/decisions/notify-dead-dep.md` — why the `notify` crate was scaffolded then removed in favor of polling
 - `docs/decisions/prompt-command-strategy.md` — `PROMPT_COMMAND` overwrite rationale
 - `PROJECT.md` / `PROJECT.ja.md` — handoff document: architecture + design decisions
 - `DESIGN.md` / `DESIGN.ja.md` — design rationale
