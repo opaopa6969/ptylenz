@@ -42,11 +42,15 @@ chmod +x ptylenz
 sudo mv ptylenz /usr/local/bin/
 ```
 
-確認:
+`PATH` に通ったか確認:
 
 ```bash
-ptylenz --version
+command -v ptylenz
 ```
+
+(ptylenz はまだ `--version` のようなフラグを解釈しない。引数なしで `ptylenz` を
+実行するとそのまま PTY セッションに入る。非対話で導入を確認するなら
+`command -v` を使う。)
 
 ---
 

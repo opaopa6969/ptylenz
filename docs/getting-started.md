@@ -42,11 +42,15 @@ chmod +x ptylenz
 sudo mv ptylenz /usr/local/bin/
 ```
 
-Verify:
+Verify it landed on your `PATH`:
 
 ```bash
-ptylenz --version
+command -v ptylenz
 ```
+
+(ptylenz does not yet parse flags like `--version`; running `ptylenz` with no
+arguments drops you straight into the PTY session. `command -v` is the
+non-interactive way to confirm the install.)
 
 ---
 
