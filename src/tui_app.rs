@@ -135,6 +135,11 @@ enum Mode {
         /// Populated after a search is run. n/N cycle through its results
         /// until a new search is started or the user leaves Ptylenz mode.
         last_search: Option<SearchState>,
+        /// Transient one-line message shown in the status bar (e.g. "copied
+        /// 4316 chars"). Cleared at the start of every key iteration, so a
+        /// message set by a handler is visible for exactly one draw cycle
+        /// — the next keypress replaces or clears it.
+        status_message: Option<String>,
     },
 }
 
@@ -186,6 +191,15 @@ impl App {
         // Alt-screen terminal — only exists while Ptylenz mode is active.
         let mut ptylenz_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
 
+        // Dirty flag for the overlay. The poller wakes every 80ms even when
+        // nothing happened; redrawing on every wake used to stream a small
+        // per-frame epilogue (SGR reset + cursor-hide) to the terminal ~12
+        // times a second while idle — wasteful, and a flicker source on slow
+        // or remote terminals. Now we only draw when something that affects
+        // the frame actually changed: keystrokes, PTY output (block data),
+        // Claude events, or a resize.
+        let mut needs_redraw = false;
+
         loop {
             if !proxy.child_alive() {
                 break;
@@ -197,12 +211,16 @@ impl App {
                     if let Some(term) = ptylenz_term.as_mut() {
                         term.autoresize().ok();
                     }
+                    needs_redraw = true;
                 }
             }
 
             loop {
                 match claude_rx.try_recv() {
-                    Ok(ev) => proxy.blocks_mut().ingest_claude_event(ev),
+                    Ok(ev) => {
+                        proxy.blocks_mut().ingest_claude_event(ev);
+                        needs_redraw = true;
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                 }
@@ -226,7 +244,11 @@ impl App {
                             }
                             // Ptylenz mode: the block engine still consumes
                             // the bytes (done inside read_output), but we
-                            // don't paint them over the alt-screen UI.
+                            // don't paint them over the alt-screen UI. The
+                            // list does show live data (line counts, the
+                            // running block), so new output marks the frame
+                            // dirty.
+                            needs_redraw = true;
                         }
                         Err(e) => {
                             let msg = format!("{e}");
@@ -248,6 +270,7 @@ impl App {
                                 &mut proxy,
                                 &mut ptylenz_term,
                             )?;
+                            needs_redraw = true;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                         Err(e) => return Err(e).context("read stdin"),
@@ -255,10 +278,11 @@ impl App {
                 }
             }
 
-            if matches!(mode, Mode::Ptylenz { .. }) {
+            if needs_redraw && matches!(mode, Mode::Ptylenz { .. }) {
                 if let Some(term) = ptylenz_term.as_mut() {
                     draw_ptylenz(term, &mode, &proxy)?;
                 }
+                needs_redraw = false;
             }
         }
 
@@ -332,6 +356,7 @@ fn enter_ptylenz(
         view: PtylenzView::List,
         search_input: None,
         last_search: None,
+        status_message: None,
     };
 
     draw_ptylenz(&mut term, mode, proxy)?;
@@ -342,11 +367,36 @@ fn enter_ptylenz(
 fn leave_ptylenz(
     mode: &mut Mode,
     ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    proxy: &PtyProxy,
 ) -> Result<()> {
     if let Some(mut term) = ptylenz_term.take() {
         let _ = term.show_cursor();
     }
-    execute!(io::stdout(), LeaveAlternateScreen).context("leave alt screen")?;
+
+    if proxy.blocks().shadow_alternate_screen() {
+        // The child is a full-screen TUI and owns the terminal's alternate
+        // screen. Our overlay borrowed that same alternate buffer, so simply
+        // dropping back to the primary screen (`LeaveAlternateScreen`) would
+        // strand the child: the terminal would show the pre-TUI primary screen
+        // while the child kept drawing into the now-hidden alternate buffer,
+        // leaving a garbled display until it happened to repaint. Instead we
+        // stay in the alternate buffer and replay the child's current frame
+        // from the shadow emulator, so it re-appears exactly as it was — plus
+        // whatever it drew while the overlay was up. We deliberately do NOT
+        // emit LeaveAlternateScreen here; the child still owns the buffer and
+        // its own `?1049l` at exit will restore the primary screen.
+        let mut stdout = io::stdout();
+        stdout
+            .write_all(&proxy.blocks().shadow_repaint_bytes())
+            .context("repaint child frame")?;
+        stdout.flush().context("flush child repaint")?;
+    } else {
+        // Line-oriented child (bash, claude, …): the terminal's own
+        // alternate-screen save/restore reproduces the correct primary screen,
+        // so a plain leave is all that's needed.
+        execute!(io::stdout(), LeaveAlternateScreen).context("leave alt screen")?;
+    }
+
     *mode = Mode::Normal;
     Ok(())
 }
@@ -361,7 +411,7 @@ fn handle_ptylenz_bytes(
     for (code, ctrl) in keys {
         // Ctrl+] always leaves Ptylenz mode, regardless of sub-state.
         if ctrl && code == Key::Char(']') {
-            return leave_ptylenz(mode, ptylenz_term);
+            return leave_ptylenz(mode, ptylenz_term, proxy);
         }
 
         let Mode::Ptylenz {
@@ -369,14 +419,19 @@ fn handle_ptylenz_bytes(
             view,
             search_input,
             last_search,
+            status_message,
         } = mode
         else {
             return Ok(());
         };
 
+        // Clear any status message from the previous key. Handlers below may
+        // set a new one; if they don't, the message area reverts to help.
+        *status_message = None;
+
         // Detail view captures everything; never falls back to list bindings.
         if let PtylenzView::Detail(detail) = view {
-            match handle_detail_key(code, ctrl, detail, *selected, proxy) {
+            match handle_detail_key(code, ctrl, detail, *selected, proxy, status_message) {
                 DetailOutcome::StayInDetail => {}
                 DetailOutcome::BackToList => {
                     *view = PtylenzView::List;
@@ -397,7 +452,7 @@ fn handle_ptylenz_bytes(
 
         match code {
             Key::Char('q') | Key::Esc => {
-                return leave_ptylenz(mode, ptylenz_term);
+                return leave_ptylenz(mode, ptylenz_term, proxy);
             }
             Key::Char('j') | Key::Down => {
                 let max = proxy.blocks().block_count().saturating_sub(1);
@@ -445,8 +500,10 @@ fn handle_ptylenz_bytes(
                 if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
                     let id = block.id;
                     let text = block.output_text();
+                    let chars = text.chars().count();
                     copy_to_clipboard(&text);
-                    eprint!("\r\n[ptylenz] copied block #{}\r\n", id);
+                    *status_message =
+                        Some(format!("copied block #{} ({} chars)", id, chars));
                 }
             }
             Key::Char('e') => {
@@ -456,11 +513,11 @@ fn handle_ptylenz_bytes(
                     chrono::Local::now().format("%Y%m%d-%H%M%S")
                 );
                 std::fs::write(&path, json)?;
-                eprint!(
-                    "\r\n[ptylenz] exported {} blocks → {}\r\n",
+                *status_message = Some(format!(
+                    "exported {} blocks → {}",
                     proxy.blocks().block_count(),
                     path
-                );
+                ));
             }
             Key::Char('p') => {
                 if let Some(block) = proxy.blocks().get_block_by_index(*selected) {
@@ -486,6 +543,7 @@ fn handle_detail_key(
     detail: &mut DetailState,
     selected_index: usize,
     proxy: &PtyProxy,
+    status_message: &mut Option<String>,
 ) -> DetailOutcome {
     // Resolve the block & line buffer once per key — cheap, and avoids holding
     // a borrow across the cursor-mutation logic below.
@@ -601,19 +659,23 @@ fn handle_detail_key(
                     out
                 }
             };
+            let chars = text.chars().count();
             copy_to_clipboard(&text);
-            eprint!(
-                "\r\n[ptylenz] copied {} chars from block #{}\r\n",
-                text.chars().count(),
-                detail.block_id
-            );
+            *status_message = Some(format!(
+                "copied {} chars from block #{}",
+                chars, detail.block_id
+            ));
             detail.selection = Selection::None;
         }
         // Y: always yank the whole block (vim's Y semantic, adapted).
         (Key::Char('Y'), false) => {
             let text = lines.join("\n");
+            let chars = text.chars().count();
             copy_to_clipboard(&text);
-            eprint!("\r\n[ptylenz] copied block #{}\r\n", detail.block_id);
+            *status_message = Some(format!(
+                "copied block #{} ({} chars)",
+                detail.block_id, chars
+            ));
         }
         _ => {}
     }
@@ -780,6 +842,7 @@ fn draw_ptylenz(
         view,
         search_input,
         last_search,
+        status_message,
     } = mode
     else {
         return Ok(());
@@ -851,8 +914,12 @@ fn draw_ptylenz(
                 }
             }
         };
+        let line = match status_message {
+            Some(msg) => format!(" [ptylenz] {}", msg),
+            None => format!(" [ptylenz] {}   blocks: {}", help, proxy.blocks().block_count()),
+        };
         let status = Paragraph::new(Span::styled(
-            format!(" [ptylenz] {}   blocks: {}", help, proxy.blocks().block_count()),
+            line,
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ));
         f.render_widget(status, chunks[1]);
@@ -1153,30 +1220,36 @@ fn copy_to_clipboard(text: &str) {
     let encoded = base64_encode(text.as_bytes());
     eprint!("\x1b]52;c;{}\x07", encoded);
 
-    #[cfg(target_os = "linux")]
+    // The external clipboard helper is best-effort. Writing to its stdin and
+    // wait()ing used to run inline on the event-loop thread; when the helper
+    // stalls (xclip with an unreachable X server — typical on headless WSL),
+    // that froze the whole UI until it timed out. Push the write+wait to a
+    // detached thread: the OSC 52 above has already covered capable
+    // terminals, and the helper finishes (or fails) in the background. The
+    // wait() inside the thread also reaps the child, so no zombies.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
-    }
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            use std::process::{Command, Stdio};
 
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::{Command, Stdio};
-        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
+            #[cfg(target_os = "linux")]
+            let spawned = Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(Stdio::piped())
+                .spawn();
+            #[cfg(target_os = "macos")]
+            let spawned = Command::new("pbcopy").stdin(Stdio::piped()).spawn();
+
+            if let Ok(mut child) = spawned {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                // Close stdin so the helper sees EOF, then reap it.
+                drop(child.stdin.take());
+                let _ = child.wait();
             }
-            let _ = child.wait();
-        }
+        });
     }
 }
 

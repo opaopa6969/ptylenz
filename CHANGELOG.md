@@ -11,6 +11,24 @@ ptylenz uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+**OSC parser no longer swallows the stream on a stray introducer**
+- A bare `\e]` embedded in binary or mangled child output (e.g. `cat` of a binary file) used to drop the parser into `OscBody` and buffer *every* following byte until an incidental `BEL`/`ST` arrived — blanking the terminal in the meantime. The body now aborts on any C0 control byte (which can never appear in a well-formed OSC string) and is bounded by `OSC_MAX_LEN` (1 MiB); on abort the buffered bytes are re-emitted verbatim so no output is lost.
+- Merged the redundant `OscStart` state into `OscBody` so an empty OSC (`\e]\a`) is handled instead of consuming its own terminator and hanging.
+
+### Changed
+
+**Overlay redraws only when the frame can have changed (dirty flag)**
+- The event loop used to call `draw_ptylenz` on every 80ms poll wake, streaming a small SGR-reset/cursor-hide epilogue to the terminal ~12×/s even while completely idle (~300 B/s measured) — wasteful, and a flicker source on slow or remote terminals. A `needs_redraw` flag now gates drawing on actual changes: keystrokes, PTY output, Claude events, resize. Idle emission drops to 0 bytes; keypress redraws still work (verified with a PTY driver harness).
+
+**Clipboard helper no longer blocks the event loop**
+- `copy_to_clipboard` used to `wait()` inline for `xclip`/`pbcopy`; with an unreachable X server (headless WSL is the typical case) that froze the whole UI until the helper timed out. The write+wait now runs on a detached thread — OSC 52 still fires immediately for capable terminals, and the thread's `wait()` reaps the child so no zombies accumulate.
+
+**Overlay exit repaints full-screen TUI children (no more garbled screen)**
+- Leaving Ptylenz mode (`Ctrl+]` / `q` / `Esc`) while a full-screen TUI (`vim`, `less`, `mc`, …) is running under ptylenz previously dropped straight back to the primary screen, stranding the child: it kept drawing into the now-hidden alternate buffer, leaving a stale/garbled display until it happened to repaint.
+- A persistent shadow `vt100` emulator now mirrors the whole session (observing the clean stream only — Normal mode stays byte-for-byte transparent). When the child owns the alternate screen, overlay exit replays its current frame via `state_formatted()` instead of `LeaveAlternateScreen`, so the TUI re-appears intact — including anything it drew while the overlay was up.
+
 ### Planned
 - Shell input completion via LSP (separate process)
 - Shell-script debugger via DAP (separate process)

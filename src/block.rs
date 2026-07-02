@@ -174,6 +174,18 @@ pub struct BlockEngine {
     /// the most recent frame. Presence of Some(_) also signals "this block
     /// used alt-screen" to the finalizer.
     last_alt_snapshot: Option<String>,
+    /// Persistent vt100 emulator mirroring the *whole* session — every clean
+    /// byte the real terminal sees, across all blocks. Unlike the per-block
+    /// `vt_parser` (which resets each command to capture that command's frame),
+    /// this one is never reset, so it always holds the child's current on-screen
+    /// state. It is used only to repaint the child when we leave the ptylenz
+    /// overlay: if the child is a full-screen TUI (vim/less/mc/…) it owns the
+    /// terminal's alternate screen, and dropping our overlay would otherwise
+    /// leave a stale, garbled frame until the child happened to redraw. We
+    /// replay this emulator's state instead. It never alters the passthrough
+    /// bytes — it only observes them — so Normal mode stays byte-for-byte
+    /// transparent, matching the project's "invisible proxy" design.
+    shadow: vt100::Parser,
 }
 
 /// Scrollback depth for the shadow vt100 parser. Short TUI commands don't
@@ -195,6 +207,9 @@ impl BlockEngine {
             term_rows: 24,
             term_cols: 80,
             last_alt_snapshot: None,
+            // Scrollback 0: the shadow only ever needs the visible screen to
+            // repaint the child, never history.
+            shadow: vt100::Parser::new(24, 80, 0),
         }
     }
 
@@ -206,6 +221,21 @@ impl BlockEngine {
         if let Some(parser) = self.vt_parser.as_mut() {
             parser.set_size(self.term_rows, self.term_cols);
         }
+        self.shadow.set_size(self.term_rows, self.term_cols);
+    }
+
+    /// True if the child currently owns the alternate screen (i.e. a
+    /// full-screen TUI is running). Drives the overlay-exit repaint decision.
+    pub fn shadow_alternate_screen(&self) -> bool {
+        self.shadow.screen().alternate_screen()
+    }
+
+    /// Escape sequences that reproduce the child's current on-screen state
+    /// (contents, SGR, cursor position/visibility, input modes, title). Written
+    /// to the real terminal when leaving the overlay so a TUI child re-appears
+    /// intact instead of as a stale frame.
+    pub fn shadow_repaint_bytes(&self) -> Vec<u8> {
+        self.shadow.screen().state_formatted()
     }
 
     /// Convert a `ClaudeEvent` into a block.
@@ -297,6 +327,12 @@ impl BlockEngine {
                 }
             }
         }
+
+        // Keep the persistent shadow emulator in lock-step with what the real
+        // terminal receives. OSC 133 markers are already stripped from
+        // `all_clean` and are zero-width anyway, so feeding the clean stream
+        // reproduces the child's true visible state without side effects.
+        self.shadow.process(&all_clean);
 
         (all_clean, all_events)
     }
@@ -601,13 +637,20 @@ struct OscParser {
 enum ParseState {
     Normal,
     Escape,      // saw \e
-    OscStart,    // saw \e]
-    OscBody,     // accumulating until \a or \e\\
+    OscBody,     // saw \e]; accumulating until \a or \e\\
     /// Just consumed an OSC 133 terminated by ESC; the next byte is expected
     /// to be `\` (completing the ST sequence) and should be swallowed so it
     /// doesn't reach the terminal as a stray char.
     OscStSwallow,
 }
+
+/// Upper bound on an OSC body before we give up waiting for a terminator and
+/// flush the bytes verbatim. A well-formed OSC (title, hyperlink, OSC 52
+/// clipboard, …) terminates long before this; the cap only guards against a
+/// stray `ESC ]` in binary/mangled output turning into an unbounded sink that
+/// swallows the rest of the stream. 1 MiB comfortably fits a large OSC 52
+/// clipboard payload while still bounding worst-case buffering.
+const OSC_MAX_LEN: usize = 1 << 20;
 
 impl OscParser {
     fn new() -> Self {
@@ -654,7 +697,11 @@ impl OscParser {
                 }
                 ParseState::Escape => {
                     if byte == b']' {
-                        self.state = ParseState::OscStart;
+                        // Go straight to OscBody (no separate OscStart state) so
+                        // the very first body byte is still checked against the
+                        // terminators — otherwise an empty OSC like `ESC ] BEL`
+                        // would consume its own terminator and hang the parser.
+                        self.state = ParseState::OscBody;
                         self.buf.clear();
                     } else {
                         pending.push(0x1b);
@@ -662,16 +709,25 @@ impl OscParser {
                         self.state = ParseState::Normal;
                     }
                 }
-                ParseState::OscStart => {
-                    self.state = ParseState::OscBody;
-                    self.buf.push(byte);
-                }
                 ParseState::OscBody => {
                     if byte == 0x07 || byte == 0x1b {
                         // Emit any bytes that accumulated _before_ this OSC
                         // so the event sits at the correct point in the
                         // stream.
                         self.finish_osc(&mut pending, &mut out, byte);
+                    } else if byte < 0x20 {
+                        // Any other C0 control byte cannot appear in a
+                        // well-formed OSC string. This is the guard against a
+                        // stray `ESC ]` inside binary or mangled output (e.g.
+                        // `cat` of a binary file): without it the parser would
+                        // silently swallow every subsequent byte until it hit an
+                        // incidental BEL, blanking the terminal. Abort the OSC,
+                        // re-emit what we buffered verbatim, and resume.
+                        self.abort_osc(&mut pending, byte);
+                    } else if self.buf.len() >= OSC_MAX_LEN {
+                        // Runaway un-terminated OSC made entirely of printable
+                        // bytes. Bail the same way to bound buffering.
+                        self.abort_osc(&mut pending, byte);
                     } else {
                         self.buf.push(byte);
                     }
@@ -726,6 +782,20 @@ impl OscParser {
                 self.state = ParseState::Normal;
             }
         }
+    }
+
+    /// Abort a malformed / un-terminated OSC: re-emit the `ESC ]` introducer
+    /// and everything buffered so far verbatim, followed by the byte that
+    /// triggered the abort, then return to Normal. Nothing is consumed as an
+    /// event — the bytes reach the terminal exactly as they arrived, so a
+    /// stray introducer never eats real output.
+    fn abort_osc(&mut self, pending: &mut Vec<u8>, byte: u8) {
+        let payload = std::mem::take(&mut self.buf);
+        pending.push(0x1b);
+        pending.push(b']');
+        pending.extend_from_slice(&payload);
+        pending.push(byte);
+        self.state = ParseState::Normal;
     }
 
     /// Decode an OSC 133 payload.
@@ -926,6 +996,55 @@ mod tests {
     }
 
     #[test]
+    fn stray_osc_introducer_in_binary_does_not_swallow_stream() {
+        // Regression: a bare `ESC ]` embedded in binary/mangled output (here a
+        // NUL follows, which can never be part of an OSC string) must not turn
+        // the parser into a sink that eats everything up to the next incidental
+        // BEL. The introducer and following bytes have to reach the terminal.
+        let mut parser = OscParser::new();
+        let input = b"before\x1b]\x00\x01rest-of-output\n";
+        let (clean, events) = parse_flat(&mut parser, input);
+        assert!(events.is_empty(), "no OSC event expected from garbage");
+        assert_eq!(
+            clean, input.as_ref(),
+            "aborted OSC must be re-emitted verbatim so no output is lost"
+        );
+    }
+
+    #[test]
+    fn stray_osc_introducer_recovers_and_still_detects_next_133() {
+        // After bailing out of a garbage OSC, a subsequent well-formed OSC 133
+        // must still be recognized — i.e. the parser truly returned to Normal.
+        let mut parser = OscParser::new();
+        let (clean1, ev1) = parse_flat(&mut parser, b"\x1b]\x07");
+        // `ESC ] BEL` is an *empty* OSC (payload ""), which decodes to nothing
+        // and is re-emitted verbatim rather than hanging the parser.
+        assert!(ev1.is_empty());
+        assert_eq!(clean1, b"\x1b]\x07");
+
+        let (clean2, ev2) = parse_flat(&mut parser, b"out\x1b]133;D;0\x07tail");
+        assert_eq!(clean2, b"outtail");
+        assert_eq!(ev2.len(), 1);
+        assert!(matches!(ev2[0], OscEvent::CommandEnd { exit_code: 0 }));
+    }
+
+    #[test]
+    fn unterminated_osc_is_bounded_and_flushed() {
+        // A very long all-printable OSC body with no terminator must eventually
+        // be flushed rather than buffered forever. We can't cheaply feed a full
+        // megabyte here, so just assert the mechanism: an interrupting control
+        // byte flushes everything accumulated so far.
+        let mut parser = OscParser::new();
+        let mut input = b"\x1b]52;c;".to_vec();
+        input.extend(std::iter::repeat(b'A').take(4096));
+        input.push(0x00); // control byte → abort
+        input.extend_from_slice(b"visible");
+        let (clean, events) = parse_flat(&mut parser, &input);
+        assert!(events.is_empty());
+        assert_eq!(clean, input, "buffered bytes must be flushed on abort");
+    }
+
+    #[test]
     fn test_osc_parser_consumes_133_with_st_terminator() {
         // ESC \ (ST) variant of OSC 133 — must still be fully consumed,
         // leaving no stray backslash in the clean stream.
@@ -1103,6 +1222,39 @@ mod tests {
         // without the cursor positioning we exercised.
         assert!(text.contains("HELLO TUI"));
         assert!(text.contains("GARBAGE"));
+    }
+
+    #[test]
+    fn shadow_tracks_alt_screen_and_reproduces_frame() {
+        // The persistent shadow emulator underpins the overlay-exit repaint.
+        // While a TUI child owns the alternate screen it must report so, and
+        // its repaint bytes must reproduce the visible content; once the child
+        // leaves alt-screen the flag clears again.
+        let mut engine = BlockEngine::new();
+        engine.resize(24, 80);
+
+        // Not in alt-screen initially.
+        assert!(!engine.shadow_alternate_screen());
+
+        // Child enters alt-screen and draws a frame (as vim/less/mc would).
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b[?1049h\x1b[2J\x1b[HFRAME-CONTENT-ABC");
+        assert!(
+            engine.shadow_alternate_screen(),
+            "shadow should see the child in alt-screen"
+        );
+        let repaint = engine.shadow_repaint_bytes();
+        let repaint_str = String::from_utf8_lossy(&repaint);
+        assert!(
+            repaint_str.contains("FRAME-CONTENT-ABC"),
+            "repaint bytes must reproduce the visible frame; got {:?}",
+            repaint_str
+        );
+
+        // Child leaves alt-screen: flag clears, so the exit path falls back to
+        // a plain LeaveAlternateScreen.
+        engine.feed_output(b"\x1b[?1049l");
+        assert!(!engine.shadow_alternate_screen());
     }
 
     #[test]
