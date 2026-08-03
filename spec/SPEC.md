@@ -44,7 +44,7 @@ graph TB
         PTY_READ["PtyProxy::read_output()"]
         FEED["BlockEngine::feed_output()"]
 
-        subgraph OscParser_box["OscParser (5-state machine)"]
+        subgraph OscParser_box["OscParser (4-state machine)"]
             OSC["OSC 133 検出"]
         end
 
@@ -120,7 +120,7 @@ block-beta
     block:Phase1["Phase 1: PTY + OSC 133 + TUI 基本 (実装済み v0.1)"]
         columns 2
         PTYProxy["PTY Proxy<br/>- openpty/fork<br/>- bash rcfile<br/>- SIGWINCH<br/>- polling"]
-        BlockEngine["Block Engine<br/>- OscParser (5 states)<br/>- Block lifecycle<br/>- vt100 shadow grid<br/>- search / export / pin"]
+        BlockEngine["Block Engine<br/>- OscParser (4 states)<br/>- Block lifecycle<br/>- vt100 shadow grid<br/>- search / export / pin"]
         TUIOverlay["TUI Overlay (ratatui)<br/>- List View (j/k/g/G/Enter/v/y/e/p//)<br/>- Detail View (hjkl/v/Ctrl+v/y/Y)<br/>- Search (/, n/N)<br/>- Clipboard (OSC 52 + xclip/pbcopy)"]:2
     end
 
@@ -155,7 +155,7 @@ block-beta
 
 #### Shell Integration 自動注入
 
-- `$TMPDIR/ptylenz-rc-<PID>.sh` にラッパー rcfile を書き出す
+- `$TMPDIR` 配下に、`tempfile` が生成する予測不能な名前（`ptylenz-rc-*.sh`）でラッパー rcfile を書き出す。ファイルモードは `0600`
 - `~/.bashrc` を先にソースし、その後 ptylenz integration を注入する
 - PROMPT_COMMAND / PS0 / PS1 に OSC 133 シーケンス 4 種を組み込む
 - PS1 への注入はべき等チェック付き (`*'133;A'*` の case 検査)
@@ -367,9 +367,9 @@ v0.1 ではブロック数の上限を設けていない。各ブロックの `o
 
 ## 4. ステートマシン (State Machines)
 
-### 4.1 OSC 133 パーサー (OscParser) — 5 状態
+### 4.1 OSC 133 パーサー (OscParser) — 4 状態
 
-`OscParser` は PTY バイトストリームを 1 バイトずつ処理し、OSC 133 マーカーを検出する。5 つの状態を持つ。
+`OscParser` は PTY バイトストリームを 1 バイトずつ処理し、OSC 133 マーカーを検出する。4 つの状態を持つ。
 
 #### 状態定義
 
@@ -377,8 +377,7 @@ v0.1 ではブロック数の上限を設けていない。各ブロックの `o
 enum ParseState {
     Normal,         // 通常バイト転送中
     Escape,         // \x1b を受信した
-    OscStart,       // \x1b] を受信した
-    OscBody,        // OSC ボディを buf に蓄積中
+    OscBody,        // \x1b] を受信し、OSC ボディを buf に蓄積中
     OscStSwallow,   // OSC 133 の ESC 終端後、\ を飲み込む待機中
 }
 ```
@@ -390,13 +389,10 @@ enum ParseState {
 - その他 → `Normal` (pending へ push)
 
 **Escape**
-- `]` → `OscStart` (buf をクリア)
+- `]` → `OscBody` (buf をクリア)
 - その他 → `Normal` (`\x1b` + byte を pending へ push)
 
   注: ESC の直後に `]` 以外が来た場合は CSI シーケンスや単体 ESC として扱い、`\x1b` と当該バイトを両方 clean バイトとして通過させる。
-
-**OscStart**
-- 任意バイト → `OscBody` (buf へ push)
 
 **OscBody**
 - `\x07` (BEL) → `finish_osc()` → `Normal`
@@ -422,10 +418,8 @@ stateDiagram-v2
     Normal --> Escape : \x1b
     Normal --> Normal : その他バイト<br/>(pending へ push)
 
-    Escape --> OscStart : ]
+    Escape --> OscBody : ] (buf をクリア)
     Escape --> Normal : その他<br/>(\x1b + byte → pending)
-
-    OscStart --> OscBody : 任意バイト<br/>(buf へ push)
 
     OscBody --> OscBody : その他バイト<br/>(buf へ push)
     OscBody --> Normal : \x07 (BEL)<br/>finish_osc()
@@ -599,7 +593,7 @@ stateDiagram-v2
 
 ### 5.1 PROMPT_COMMAND 上書き戦略
 
-ptylenz が bash を起動する際、ラッパー rcfile を `$TMPDIR/ptylenz-rc-<PID>.sh` に書き出す。構造:
+ptylenz が bash を起動する際、`tempfile` が `$TMPDIR` 配下に予測不能な名前（`ptylenz-rc-*.sh`）でラッパー rcfile を作成する。ファイルモードは `0600`。構造:
 
 ```
 1. [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"
@@ -647,7 +641,7 @@ sequenceDiagram
     participant jsonl as ~/.claude/projects/&lt;slug&gt;/*.jsonl
 
     Note over ptylenz,bash: 起動時: ラッパー rcfile を $TMPDIR に書き出し
-    ptylenz->>bash: execvp("bash", ["--rcfile", "/tmp/ptylenz-rc-<PID>.sh", "-i"])
+    ptylenz->>bash: execvp("bash", ["--rcfile", "/tmp/ptylenz-rc-*.sh", "-i"])
     bash-->>bash: source ~/.bashrc
     bash-->>bash: PROMPT_COMMAND = __ptylenz_precmd<br/>(OSC 133 上書き注入)
 
@@ -1235,7 +1229,7 @@ v0.1 は設定ファイルを持たない。ユーザー設定可能なパラメ
 
 ### 8.2 bash integration (自動注入)
 
-ptylenz が `$TMPDIR/ptylenz-rc-<PID>.sh` に書き出す内容:
+ptylenz が `$TMPDIR` 配下の `ptylenz-rc-*.sh` に書き出す内容:
 
 ```bash
 # ptylenz wrapper rcfile — auto-generated, safe to delete

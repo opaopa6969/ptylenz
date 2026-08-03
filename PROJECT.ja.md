@@ -207,7 +207,7 @@ PROMPT_COMMAND='__ptylenz_precmd'
 
 ```
 Normal → ESC(\x1b) → Escape
-Escape → ']' → OscStart → OscBody
+Escape → ']' → OscBody
 OscBody → BEL(\x07) → [decode] → Normal
 OscBody → ESC \\ (ST) → [decode] → Normal
 Escape → other → emit(ESC + byte) → Normal

@@ -38,7 +38,7 @@ flowchart TB
     Bash --> Commands
 ```
 
-There are four source files:
+There are five source files:
 
 | File | Responsibility |
 |------|---------------|
@@ -91,9 +91,8 @@ Block detection requires knowing exactly where each command's output begins and 
 stateDiagram-v2
     [*] --> Normal
     Normal --> Escape: \\x1b
-    Escape --> OscStart: ']'
+    Escape --> OscBody: ']' (clear buffer)
     Escape --> Normal: other (emit \\x1b + byte)
-    OscStart --> OscBody: any byte
     OscBody --> Normal: \\x07 BEL & decode<br/>OSC 133 → emit Event<br/>other → re-emit
     OscBody --> OscStSwallow: \\x1b ESC & decode<br/>OSC 133 → emit Event
     OscBody --> Normal: \\x1b ESC & other<br/>re-emit original bytes
@@ -176,7 +175,7 @@ Mode::Normal
 
 Mode::Ptylenz { selected, view, search_input, last_search, status_message }
   - PTY output → block engine only; not painted over the alt-screen UI
-  - ratatui renders on every event iteration (≤ 80 ms timeout)
+- ratatui redraws only when input, PTY output, Claude events, or a resize makes the frame dirty; the poll timeout remains ≤ 80 ms
   - Ctrl+] → back to Normal; 'q' / Esc → same
 ```
 

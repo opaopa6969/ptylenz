@@ -38,7 +38,7 @@ flowchart TB
     Bash --> Commands
 ```
 
-ソースファイル構成:
+ソースファイル構成 (5 ファイル):
 
 | ファイル | 責務 |
 |---------|------|
@@ -87,15 +87,14 @@ flowchart TB
 | `\e]133;D;N\a` | コマンド終了、終了コード N |
 | `\e]133;E;text\a` | コマンドテキスト (ブロックタイトル) |
 
-### 5 状態機械
+### 4 状態機械
 
 ```mermaid
 stateDiagram-v2
     [*] --> Normal
     Normal --> Escape: \\x1b
-    Escape --> OscStart: ']'
+    Escape --> OscBody: ']' (バッファをクリア)
     Escape --> Normal: その他 (emit \\x1b + byte)
-    OscStart --> OscBody: 任意バイト
     OscBody --> Normal: \\x07 BEL & decode<br/>OSC 133 → Event emit<br/>その他 → 再 emit
     OscBody --> OscStSwallow: \\x1b ESC & decode<br/>OSC 133 → Event emit
     OscBody --> Normal: \\x1b ESC & その他<br/>元のバイトを再 emit
@@ -178,7 +177,7 @@ Mode::Normal
 
 Mode::Ptylenz { selected, view, search_input, last_search, status_message }
   - PTY 出力 → ブロックエンジンのみ; alt-screen UI には描画しない
-  - ratatui はイベントループ毎 (最大 80 ms タイムアウト) に描画
+  - 入力、PTY 出力、Claude イベント、リサイズでフレームが dirty になったときだけ ratatui を再描画 (poll のタイムアウトは最大 80 ms)
   - Ctrl+] → Normal へ; 'q' / Esc → 同じ
 ```
 
