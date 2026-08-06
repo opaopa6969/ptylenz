@@ -1353,12 +1353,11 @@ OSC 52 クリップボードは SSH 経由で機能する場合とそうでな�
 | `serde` | 1 (derive) | derive マクロ (`Deserialize`) | — |
 | `serde_json` | 1 | JSONL デコード、エクスポート用 Value | — |
 | `vt100` | 0.15 | vt100 シャドウグリッドパーサー | `alacritty_terminal`: 依存グラフが大きすぎる |
+| `tempfile` | 3 | `write_bash_rcfile` が rcfile 生成に使用 (runtime)。テストでも使用 | `std::env::temp_dir()` + 自前生成: パス予測可能性・パーミッション制御が手間 |
 
 ### 9.2 開発依存 (`[dev-dependencies]`)
 
-| クレート | バージョン | 用途 |
-|---------|-----------|------|
-| `tempfile` | 3 | テスト用一時ファイル/ディレクトリ |
+現在 `[dev-dependencies]` に登録されているクレートはない。`tempfile` は runtime でも使用するため `[dependencies]` に配置（§9.1 参照）。
 
 ### 9.3 意図的に除外した依存
 
