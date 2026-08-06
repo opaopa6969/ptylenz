@@ -50,7 +50,7 @@ The code compiles and has the core architecture in place:
 
 - **bash stays bash** — Don't try to replace or modify bash behavior.
   ptylenz is transparent; the user shouldn't notice it's there
-  until they press Ctrl+B.
+  until they press Ctrl+].
 
 - **Zero config** — No config file required. Sensible defaults only.
 
