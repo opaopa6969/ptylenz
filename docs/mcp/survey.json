@@ -1,0 +1,108 @@
+{
+  "repo": "ptylenz",
+  "surveyed_at": "2026-08-22T00:00:00+09:00",
+  "kind": "cli",
+  "summary": "PTY プロキシ + ratatui TUI。bash を PTY の内側で動かし、OSC 133 マーカーでコマンド出力をブロック単位に構造化する。ブロックの検索・折り畳み・コピー・JSON エクスポートを提供する対話的ターミナルツール。Claude Code の JSONL セッションログを並行 tail してシェルブロックと同一タイムラインに表示する。",
+  "decision": "skip",
+  "decision_reason": "全ての能力が『人間が操作する対話的 PTY セッション』という状態に強く結びついており、ステートレスな MCP tool として切り出せる操作が存在しない。常駐サーバ化してもエージェントから呼べる意味のある操作がない（TUI は人間のキーボード操作対象）。エクスポート形式（claude-session-replay common log model）の共有は既存の claude-session-replay MCP サービスがカバーしている。ライブラリクレートでもないため他サービスからの import もない。",
+  "existing": {
+    "http_api": false,
+    "cli": true,
+    "mcp": false,
+    "healthz": false,
+    "volta_manifest": false,
+    "hosted_url": null
+  },
+  "proposed_namespace": null,
+  "capabilities": [
+    {
+      "verb": "PTY バイトストリームを OSC 133 でブロック化する",
+      "kind": "tool",
+      "name": "segment",
+      "io": "raw PTY bytes → Vec<Block{command, output, exit_code, timestamps}>",
+      "side_effect": "read",
+      "long_running": false,
+      "maps_to": "src/block.rs:BlockEngine::feed_output()"
+    },
+    {
+      "verb": "全ブロックを横断検索する",
+      "kind": "tool",
+      "name": "search",
+      "io": "query: text → Vec<(block_id, line_num, line_text)>",
+      "side_effect": "read",
+      "long_running": false,
+      "maps_to": "src/block.rs:BlockEngine::search()"
+    },
+    {
+      "verb": "セッションを claude-session-replay common log model JSON でエクスポートする",
+      "kind": "tool",
+      "name": "export",
+      "io": "session blocks → JSON string (file write)",
+      "side_effect": "write",
+      "long_running": false,
+      "maps_to": "src/block.rs:BlockEngine::export_json()"
+    },
+    {
+      "verb": "Claude Code JSONL をデコードして ClaudeEvent にする",
+      "kind": "tool",
+      "name": "decode_claude_turn",
+      "io": "JSONL line → Option<ClaudeEvent{role, text, tool_uses}>",
+      "side_effect": "read",
+      "long_running": false,
+      "maps_to": "src/claude_feeder.rs:decode_line()"
+    },
+    {
+      "verb": "能力の仕様",
+      "kind": "resource",
+      "name": "spec",
+      "uri": null
+    },
+    {
+      "verb": "使い方",
+      "kind": "resource",
+      "name": "guide",
+      "uri": null
+    },
+    {
+      "verb": "OSC 133 プロトコルとブロック化の設計意図",
+      "kind": "skill",
+      "name": "pty-block-model",
+      "locality": "repo"
+    }
+  ],
+  "composition_examples": [
+    "該当なし — ptylenz の全能力がローカル PTY セッション状態に依存し、他の MCP サービスと組み合わせる絵が描けない",
+    "エクスポート JSON は claude-session-replay MCP サービスがレンダリングできるが、それは claude-session-replay 側の能力であり ptylenz 側の MCP 化では得がない"
+  ],
+  "dependencies": [
+    {
+      "repo": "claude-session-replay",
+      "direction": "depends_on",
+      "capability": "common log model JSON フォーマット仕様（エクスポート形式の共有）",
+      "exists_now": true,
+      "note": "ptylenz の export_json() が claude-session-replay の common log model に準拠。MCP 入口ではなくデータフォーマットの依存。claude-session-replay は既に volta に MCP サービスとして参加済み。"
+    },
+    {
+      "repo": "syslenz",
+      "direction": "depends_on",
+      "capability": "設計思想・ratatui TUI 基盤の共有（兄弟プロジェクト）",
+      "exists_now": true,
+      "note": "コードレベルの依存ではなく設計上の関連。syslenz は volta に MCP サービスとして参加済みだが、ptylenz から syslenz の MCP 入口を呼ぶ用途はない。"
+    }
+  ],
+  "library_serve": {
+    "needed": false,
+    "new_work": [],
+    "runtime": "other",
+    "estimated_effort": "S"
+  },
+  "risks": [
+    "MCP 化しないため新たなリスクなし",
+    "仮にサーバ化した場合: PTY はプロセス制御（fork/exec/setsid）を伴い、サーバプロセスで安全に管理する必要があるが、対話的セッションのリモート操作は本質的に脆弱",
+    "ブロック履歴は in-memory で揮発性。サーバ化しても状態の永続化方針が未定（v0.1 では永続化なし）"
+  ],
+  "open_questions": [
+    "将来 ptylenz のブロックエンジンをライブラリクレートとして切り出し、他のツールが PTY 出力を構造化できるようにする計画はあるか？（あれば library-serve 再検討の余地があるが、現時点では PROJECT.md にその記載なし）",
+    "Claude Code JSONL のデコードロジック（claude_feeder.rs）を独立した MCP tool として公開する価値はあるか？（ただし claude-session-replay が同等のパース能力を既に持つ可能性が高い）"
+  ]
+}
