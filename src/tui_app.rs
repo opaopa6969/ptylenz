@@ -1,41 +1,40 @@
-///! TUI Application — main event loop and renderer.
-///!
-///! Two modes, no chord/prefix soup:
-///!   - Normal: full passthrough. Every keystroke except Ctrl+] goes to
-///!     bash; PTY output (OSC-stripped) flows straight to stdout. ptylenz
-///!     is invisible.
-///!   - Ptylenz: alt-screen overlay rendered by ratatui. bash keeps running
-///!     in the background but its stdin is paused while we own the terminal.
-///!
-///! Only one keystroke in Normal mode is ever intercepted: Ctrl+]
-///! (0x1d). Pressing it enters Ptylenz mode; pressing it again (or q / Esc)
-///! leaves.
-///!
-///! Ptylenz · List view (default):
-///!   j / ↓         next block
-///!   k / ↑         previous block
-///!   g / G         jump to first / last block
-///!   Enter         toggle expand/collapse of selected block
-///!   v             open Detail view of selected block
-///!   /             search sub-mode
-///!   n / N         next / previous search result
-///!   y             copy whole selected block to clipboard
-///!   e             export all blocks as JSON (current dir)
-///!   p             toggle pin on selected block
-///!   q / Esc / Ctrl+]   back to Normal
-///!
-///! Ptylenz · Detail view (one block, full-screen):
-///!   j/k/h/l       move cursor
-///!   g / G         top / bottom
-///!   0 / $         line start / end
-///!   Ctrl+u/d      page up / down
-///!   v             start/end linewise (line-range) selection
-///!   Ctrl+v        start/end blockwise (rectangular) selection
-///!   y             yank selection (or whole block if no selection)
-///!   Y             yank whole block (always)
-///!   Esc           clear selection, or back to list if none
-///!   q             back to list
-
+//! TUI Application — main event loop and renderer.
+//!
+//! Two modes, no chord/prefix soup:
+//!   - Normal: full passthrough. Every keystroke except Ctrl+] goes to
+//!     bash; PTY output (OSC-stripped) flows straight to stdout. ptylenz
+//!     is invisible.
+//!   - Ptylenz: alt-screen overlay rendered by ratatui. bash keeps running
+//!     in the background but its stdin is paused while we own the terminal.
+//!
+//! Only one keystroke in Normal mode is ever intercepted: Ctrl+]
+//! (0x1d). Pressing it enters Ptylenz mode; pressing it again (or q / Esc)
+//! leaves.
+//!
+//! Ptylenz · List view (default):
+//!   j / ↓         next block
+//!   k / ↑         previous block
+//!   g / G         jump to first / last block
+//!   Enter         toggle expand/collapse of selected block
+//!   v             open Detail view of selected block
+//!   /             search sub-mode
+//!   n / N         next / previous search result
+//!   y             copy whole selected block to clipboard
+//!   e             export all blocks as JSON (current dir)
+//!   p             toggle pin on selected block
+//!   q / Esc / Ctrl+]   back to Normal
+//!
+//! Ptylenz · Detail view (one block, full-screen):
+//!   j/k/h/l       move cursor
+//!   g / G         top / bottom
+//!   0 / $         line start / end
+//!   Ctrl+u/d      page up / down
+//!   v             start/end linewise (line-range) selection
+//!   Ctrl+v        start/end blockwise (rectangular) selection
+//!   y             yank selection (or whole block if no selection)
+//!   Y             yank whole block (always)
+//!   Esc           clear selection, or back to list if none
+//!   q             back to list
 use anyhow::{Context, Result};
 use crossterm::{
     execute,
@@ -80,7 +79,10 @@ extern "C" fn on_sigwinch(_: libc::c_int) {
 
 fn install_sigwinch_handler() {
     unsafe {
-        libc::signal(libc::SIGWINCH, on_sigwinch as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGWINCH,
+            on_sigwinch as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -102,8 +104,13 @@ struct SearchState {
 #[derive(Debug, Clone)]
 enum Selection {
     None,
-    Linewise { anchor_row: usize },
-    Blockwise { anchor_row: usize, anchor_col: usize },
+    Linewise {
+        anchor_row: usize,
+    },
+    Blockwise {
+        anchor_row: usize,
+        anchor_col: usize,
+    },
 }
 
 /// State for Detail view: full-screen view of one block with a movable
@@ -149,7 +156,9 @@ pub struct App {
 
 impl App {
     pub fn new(shell_path: &str) -> Result<Self> {
-        Ok(App { shell_path: shell_path.to_string() })
+        Ok(App {
+            shell_path: shell_path.to_string(),
+        })
     }
 
     pub fn run(self) -> Result<()> {
@@ -179,8 +188,16 @@ impl App {
         let stdin_borrowed = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
         let master_borrowed = unsafe { BorrowedFd::borrow_raw(master_fd) };
         unsafe {
-            poller.add_with_mode(&stdin_borrowed, PollEvent::readable(STDIN_KEY), PollMode::Level)?;
-            poller.add_with_mode(&master_borrowed, PollEvent::readable(PTY_KEY), PollMode::Level)?;
+            poller.add_with_mode(
+                &stdin_borrowed,
+                PollEvent::readable(STDIN_KEY),
+                PollMode::Level,
+            )?;
+            poller.add_with_mode(
+                &master_borrowed,
+                PollEvent::readable(PTY_KEY),
+                PollMode::Level,
+            )?;
         }
 
         let mut events = PollEvents::new();
@@ -264,12 +281,7 @@ impl App {
                     match read_stdin(stdin_fd, &mut sbuf) {
                         Ok(0) => return Ok(()),
                         Ok(n) => {
-                            handle_input(
-                                &sbuf[..n],
-                                &mut mode,
-                                &mut proxy,
-                                &mut ptylenz_term,
-                            )?;
+                            handle_input(&sbuf[..n], &mut mode, &mut proxy, &mut ptylenz_term)?;
                             needs_redraw = true;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -502,8 +514,7 @@ fn handle_ptylenz_bytes(
                     let text = block.output_text();
                     let chars = text.chars().count();
                     copy_to_clipboard(&text);
-                    *status_message =
-                        Some(format!("copied block #{} ({} chars)", id, chars));
+                    *status_message = Some(format!("copied block #{} ({} chars)", id, chars));
                 }
             }
             Key::Char('e') => {
@@ -552,9 +563,7 @@ fn handle_detail_key(
         None => return DetailOutcome::BackToList,
     };
     let row_count = lines.len().max(1);
-    let line_len = |row: usize| -> usize {
-        lines.get(row).map(|l| l.chars().count()).unwrap_or(0)
-    };
+    let line_len = |row: usize| -> usize { lines.get(row).map(|l| l.chars().count()).unwrap_or(0) };
 
     match (code, ctrl) {
         (Key::Char('q'), false) => return DetailOutcome::BackToList,
@@ -617,7 +626,9 @@ fn handle_detail_key(
         (Key::Char('v'), false) => {
             detail.selection = match detail.selection {
                 Selection::Linewise { .. } => Selection::None,
-                _ => Selection::Linewise { anchor_row: detail.cursor_row },
+                _ => Selection::Linewise {
+                    anchor_row: detail.cursor_row,
+                },
             };
         }
         // Visual-block mode: Ctrl+v toggles blockwise selection anchored at
@@ -640,7 +651,10 @@ fn handle_detail_key(
                     let hi = hi.min(row_count - 1);
                     lines[lo..=hi].join("\n")
                 }
-                Selection::Blockwise { anchor_row, anchor_col } => {
+                Selection::Blockwise {
+                    anchor_row,
+                    anchor_col,
+                } => {
                     let (rlo, rhi) = sort_pair(*anchor_row, detail.cursor_row);
                     let (clo, chi) = sort_pair(*anchor_col, detail.cursor_col);
                     let rhi = rhi.min(row_count - 1);
@@ -684,7 +698,11 @@ fn handle_detail_key(
 }
 
 fn sort_pair(a: usize, b: usize) -> (usize, usize) {
-    if a <= b { (a, b) } else { (b, a) }
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 enum SearchInputOutcome {
@@ -927,12 +945,7 @@ fn draw_ptylenz(
     Ok(())
 }
 
-fn draw_blocks(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    proxy: &PtyProxy,
-    selected: usize,
-) {
+fn draw_blocks(f: &mut ratatui::Frame, area: Rect, proxy: &PtyProxy, selected: usize) {
     let all: Vec<&Block> = proxy
         .blocks()
         .completed_blocks()
@@ -940,17 +953,12 @@ fn draw_blocks(
         .chain(proxy.blocks().current_block())
         .collect();
 
-    let items: Vec<ListItem> = all
-        .iter()
-        .map(|b| build_list_item(b))
-        .collect();
+    let items: Vec<ListItem> = all.iter().map(|b| build_list_item(b)).collect();
 
-    let block = RBlock::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " ptylenz · blocks ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+    let block = RBlock::default().borders(Borders::ALL).title(Span::styled(
+        " ptylenz · blocks ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     let list = List::new(items).block(block).highlight_style(
         Style::default()
             .bg(Color::DarkGray)
@@ -965,12 +973,7 @@ fn draw_blocks(
 
 /// Render the Detail view: one block, full body, with cursor and optional
 /// linewise / blockwise highlight. Auto-scrolls so the cursor stays in view.
-fn draw_detail(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    proxy: &PtyProxy,
-    detail: &DetailState,
-) {
+fn draw_detail(f: &mut ratatui::Frame, area: Rect, proxy: &PtyProxy, detail: &DetailState) {
     let block_ref = proxy.blocks().get_block(detail.block_id);
     let (title, lines): (String, Vec<String>) = match block_ref {
         Some(b) => (
@@ -994,9 +997,7 @@ fn draw_detail(
 
     // Compute viewport scroll so the cursor row is visible.
     let viewport_h = inner.height as usize;
-    let scroll_top = if viewport_h == 0 {
-        0usize
-    } else if detail.cursor_row < viewport_h {
+    let scroll_top = if viewport_h == 0 || detail.cursor_row < viewport_h {
         0
     } else {
         detail.cursor_row + 1 - viewport_h
@@ -1012,8 +1013,7 @@ fn draw_detail(
     let mut rendered: Vec<Line> = Vec::with_capacity(viewport_h);
     let visible_end = (scroll_top + viewport_h).min(lines.len());
 
-    for row in scroll_top..visible_end {
-        let line_str = &lines[row];
+    for (row, line_str) in lines.iter().enumerate().take(visible_end).skip(scroll_top) {
         let chars: Vec<char> = line_str.chars().collect();
 
         let (sel_lo, sel_hi) = selection_range_for_row(&detail.selection, detail, row, chars.len());
@@ -1023,12 +1023,16 @@ fn draw_detail(
 
         // Walk every column position [0..max(chars.len, cursor_col+1)] so we
         // can paint the cursor even when it sits past end-of-line.
-        let max_col = chars.len().max(if cursor_in_this_row { detail.cursor_col + 1 } else { 0 });
+        let max_col = chars.len().max(if cursor_in_this_row {
+            detail.cursor_col + 1
+        } else {
+            0
+        });
         let mut col = 0;
         while col < max_col {
             let ch = chars.get(col).copied().unwrap_or(' ');
 
-            let in_selection = sel_lo.map_or(false, |lo| col >= lo && col < sel_hi.unwrap_or(0));
+            let in_selection = sel_lo.is_some_and(|lo| col >= lo && col < sel_hi.unwrap_or(0));
             let is_cursor = cursor_in_this_row && col == detail.cursor_col;
 
             let style = if is_cursor {
@@ -1069,7 +1073,10 @@ fn selection_range_for_row(
                 (None, None)
             }
         }
-        Selection::Blockwise { anchor_row, anchor_col } => {
+        Selection::Blockwise {
+            anchor_row,
+            anchor_col,
+        } => {
             let (rlo, rhi) = sort_pair(*anchor_row, detail.cursor_row);
             if row < rlo || row > rhi {
                 return (None, None);
@@ -1312,7 +1319,14 @@ mod tests {
 
     #[test]
     fn blockwise_range_clamps_to_line_length() {
-        let d = detail_at(2, 8, Selection::Blockwise { anchor_row: 0, anchor_col: 3 });
+        let d = detail_at(
+            2,
+            8,
+            Selection::Blockwise {
+                anchor_row: 0,
+                anchor_col: 3,
+            },
+        );
         // Long line: full block columns visible.
         assert_eq!(
             selection_range_for_row(&d.selection, &d, 1, 20),
@@ -1333,7 +1347,14 @@ mod tests {
     #[test]
     fn blockwise_range_handles_reversed_anchor() {
         // Cursor sits above-and-left of the anchor — the range is sorted.
-        let d = detail_at(0, 2, Selection::Blockwise { anchor_row: 4, anchor_col: 7 });
+        let d = detail_at(
+            0,
+            2,
+            Selection::Blockwise {
+                anchor_row: 4,
+                anchor_col: 7,
+            },
+        );
         assert_eq!(
             selection_range_for_row(&d.selection, &d, 2, 20),
             (Some(2), Some(8))

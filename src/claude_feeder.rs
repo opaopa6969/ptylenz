@@ -46,10 +46,7 @@ pub enum ClaudeEvent {
         timestamp: Option<String>,
     },
     /// The feeder switched to a new session file (claude restarted, /resume).
-    SessionStarted {
-        session_id: String,
-        path: PathBuf,
-    },
+    SessionStarted { session_id: String, path: PathBuf },
 }
 
 #[derive(Debug, Clone)]
@@ -246,10 +243,8 @@ fn extract_text_and_tools(message: &RawMessage) -> (String, Vec<ToolUse>) {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let input_json = obj
-                                .get("input")
-                                .map(|v| v.to_string())
-                                .unwrap_or_default();
+                            let input_json =
+                                obj.get("input").map(|v| v.to_string()).unwrap_or_default();
                             tools.push(ToolUse { name, input_json });
                         }
                         // tool_result, thinking, etc. — skip for now, we
@@ -340,7 +335,8 @@ mod tests {
 
     #[test]
     fn decode_skips_non_turn_lines() {
-        let line = r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s3"}"#;
+        let line =
+            r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s3"}"#;
         assert!(decode_line(line).is_none());
 
         let line2 = r#"{"type":"file-history-snapshot","messageId":"m"}"#;

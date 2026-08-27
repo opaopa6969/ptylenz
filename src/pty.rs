@@ -1,12 +1,11 @@
-///! PTY Proxy — sits between the real terminal and a child shell.
-///!
-///! Architecture:
-///!   Terminal (stdin/stdout) <-> ptylenz (PTY master) <-> bash (PTY slave)
-///!
-///! All bytes flowing in both directions pass through ptylenz,
-///! allowing us to detect block boundaries (via OSC markers)
-///! and index the output.
-
+//! PTY Proxy — sits between the real terminal and a child shell.
+//!
+//! Architecture:
+//!   Terminal (stdin/stdout) <-> ptylenz (PTY master) <-> bash (PTY slave)
+//!
+//! All bytes flowing in both directions pass through ptylenz,
+//! allowing us to detect block boundaries (via OSC markers)
+//! and index the output.
 use anyhow::{Context, Result};
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
@@ -66,13 +65,17 @@ impl PtyProxy {
         let is_bash = std::path::Path::new(shell_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .map_or(false, |n| n == "bash");
+            == Some("bash");
 
         // Write shell integration to a temp rcfile that also sources user's ~/.bashrc.
         // Using --rcfile with a wrapper preserves the user's bash environment while
         // letting us inject the OSC 133 markers we need for block detection.
         // Only done for bash; other shells don't support --rcfile.
-        let rcfile = if is_bash { Some(write_bash_rcfile()?) } else { None };
+        let rcfile = if is_bash {
+            Some(write_bash_rcfile()?)
+        } else {
+            None
+        };
 
         // Create PTY pair with the real terminal's size baked in. Without this
         // the kernel hands us 0×0 (or 80×24 on some platforms) and any child
@@ -80,8 +83,8 @@ impl PtyProxy {
         // which do exactly this during setupterm — draws at the wrong width
         // and the real terminal wraps every line into a diagonal staircase.
         let initial_ws = query_winsize();
-        let OpenptyResult { master, slave } = openpty(initial_ws.as_ref(), None)
-            .context("Failed to open PTY pair")?;
+        let OpenptyResult { master, slave } =
+            openpty(initial_ws.as_ref(), None).context("Failed to open PTY pair")?;
 
         let block_engine = BlockEngine::new();
 
@@ -123,13 +126,14 @@ impl PtyProxy {
                 // start.
                 if is_bash {
                     if let Some(ref tmp) = rcfile {
-                        let rcfile_cstr = match CString::new(tmp.path().as_os_str().as_encoded_bytes()) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                eprintln!("ptylenz: rcfile path contains NUL byte");
-                                std::process::exit(126);
-                            }
-                        };
+                        let rcfile_cstr =
+                            match CString::new(tmp.path().as_os_str().as_encoded_bytes()) {
+                                Ok(s) => s,
+                                Err(_) => {
+                                    eprintln!("ptylenz: rcfile path contains NUL byte");
+                                    std::process::exit(126);
+                                }
+                            };
                         let rcfile_flag = CString::new("--rcfile").expect("static string");
                         let interactive_flag = CString::new("-i").expect("static string");
                         let args = [shell.clone(), rcfile_flag, rcfile_cstr, interactive_flag];
@@ -141,12 +145,12 @@ impl PtyProxy {
                         let _ = &tmp;
                         unistd::execvp(&shell, &args).ok();
                     } else {
-                        unistd::execvp(&shell, &[shell.clone()]).ok();
+                        unistd::execvp(&shell, std::slice::from_ref(&shell)).ok();
                     }
                 } else {
                     // For non-bash shells just exec the shell directly without
                     // any bash-specific flags.
-                    unistd::execvp(&shell, &[shell.clone()]).ok();
+                    unistd::execvp(&shell, std::slice::from_ref(&shell)).ok();
                 }
                 std::process::exit(127);
             }
@@ -171,8 +175,7 @@ impl PtyProxy {
     /// Returns (clean_bytes_without_osc_133, detected_events).
     /// The clean bytes are safe to forward directly to the user's terminal.
     pub fn read_output(&mut self, buf: &mut [u8]) -> Result<(Vec<u8>, Vec<OscEvent>)> {
-        let n = unistd::read(self.master.as_raw_fd(), buf)
-            .context("read from PTY master")?;
+        let n = unistd::read(self.master.as_raw_fd(), buf).context("read from PTY master")?;
         if n == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -183,24 +186,22 @@ impl PtyProxy {
 
     /// Write to the PTY master (user's input → child's stdin).
     pub fn write_input(&self, data: &[u8]) -> Result<usize> {
-        let n = unistd::write(&self.master, data)
-            .context("write to PTY master")?;
+        let n = unistd::write(&self.master, data).context("write to PTY master")?;
         Ok(n)
     }
 
     /// Send a signal to the child shell.
     pub fn signal_child(&self, sig: Signal) -> Result<()> {
-        signal::kill(self.child_pid, sig)
-            .context("signal child")?;
+        signal::kill(self.child_pid, sig).context("signal child")?;
         Ok(())
     }
 
     /// Check if child is still running.
     pub fn child_alive(&self) -> bool {
-        match waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => true,
-            _ => false,
-        }
+        matches!(
+            waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG)),
+            Ok(WaitStatus::StillAlive)
+        )
     }
 
     /// Resize the PTY (forward terminal resize to child).
@@ -399,10 +400,16 @@ mod tests {
             "expected at least one block after driving bash"
         );
         // We should have seen `echo hello-ptylenz` somewhere
-        let any_echo = blocks
-            .iter()
-            .any(|b| b.command.as_deref().map_or(false, |c| c.contains("echo hello-ptylenz")));
-        assert!(any_echo, "expected to capture the echo command; blocks={:?}", blocks.iter().map(|b| &b.command).collect::<Vec<_>>());
+        let any_echo = blocks.iter().any(|b| {
+            b.command
+                .as_deref()
+                .map_or(false, |c| c.contains("echo hello-ptylenz"))
+        });
+        assert!(
+            any_echo,
+            "expected to capture the echo command; blocks={:?}",
+            blocks.iter().map(|b| &b.command).collect::<Vec<_>>()
+        );
     }
 
     /// End-to-end: run a command that enters the alternate screen (the mc /
@@ -482,9 +489,11 @@ mod tests {
         proxy.write_input(b"exit\n").unwrap();
 
         let blocks = proxy.blocks().completed_blocks();
-        let echo_block = blocks
-            .iter()
-            .find(|b| b.command.as_deref().map_or(false, |c| c.contains("LINE-ONE")));
+        let echo_block = blocks.iter().find(|b| {
+            b.command
+                .as_deref()
+                .map_or(false, |c| c.contains("LINE-ONE"))
+        });
         assert!(
             echo_block.is_some(),
             "expected a non-alt-screen block for the echo command; blocks={:?}",
@@ -492,9 +501,21 @@ mod tests {
         );
         let b = echo_block.unwrap();
         let text = b.output_text();
-        assert!(text.contains("LINE-ONE"), "missing LINE-ONE; text={:?}", text);
-        assert!(text.contains("LINE-TWO"), "missing LINE-TWO; text={:?}", text);
-        assert!(text.contains("LINE-THREE"), "missing LINE-THREE; text={:?}", text);
+        assert!(
+            text.contains("LINE-ONE"),
+            "missing LINE-ONE; text={:?}",
+            text
+        );
+        assert!(
+            text.contains("LINE-TWO"),
+            "missing LINE-TWO; text={:?}",
+            text
+        );
+        assert!(
+            text.contains("LINE-THREE"),
+            "missing LINE-THREE; text={:?}",
+            text
+        );
         // cached_line_count should match the number of newlines we actually saw.
         let actual_newlines = b.output.iter().filter(|&&c| c == b'\n').count();
         assert_eq!(
