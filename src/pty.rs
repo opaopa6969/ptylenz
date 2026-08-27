@@ -52,6 +52,9 @@ pub struct PtyProxy {
     master: OwnedFd,
     child_pid: Pid,
     block_engine: BlockEngine,
+    // The parent must keep the generated file linked until bash has opened it.
+    // Dropping it as `spawn` returns races the child process before `execvp`.
+    _rcfile: Option<NamedTempFile>,
 }
 
 impl PtyProxy {
@@ -153,6 +156,7 @@ impl PtyProxy {
                     master,
                     child_pid: child,
                     block_engine,
+                    _rcfile: rcfile,
                 })
             }
         }
@@ -287,6 +291,90 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn prepare_for_polling(proxy: &PtyProxy) {
+        unsafe {
+            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
+            assert!(flags >= 0, "failed to get PTY flags");
+            assert!(
+                libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0,
+                "failed to make PTY non-blocking"
+            );
+        }
+    }
+
+    fn poll_until<F>(proxy: &mut PtyProxy, description: &str, mut reached: F)
+    where
+        F: FnMut(&PtyProxy, &[OscEvent]) -> bool,
+    {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let mut buf = [0u8; 8192];
+        let mut observed_events = Vec::new();
+        let mut last_error = None;
+
+        loop {
+            let events = match proxy.read_output(&mut buf) {
+                Ok((_, events)) => {
+                    observed_events.extend(events.iter().map(|event| format!("{event:?}")));
+                    events
+                }
+                Err(error) => {
+                    last_error = Some(format!("{error:#}"));
+                    Vec::new()
+                }
+            };
+
+            if reached(proxy, &events) {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                let commands = proxy
+                    .blocks()
+                    .completed_blocks()
+                    .iter()
+                    .map(|block| block.command.as_deref())
+                    .collect::<Vec<_>>();
+                panic!(
+                    "timed out waiting for {description}; observed_events={observed_events:?}; \
+                     completed_commands={commands:?}; child_alive={}; last_error={last_error:?}",
+                    proxy.child_alive()
+                );
+            }
+
+            thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn wait_for_prompt(proxy: &mut PtyProxy) {
+        poll_until(proxy, "initial prompt marker (OSC 133;A)", |_, events| {
+            events
+                .iter()
+                .any(|event| matches!(event, OscEvent::PromptStart))
+        });
+    }
+
+    fn wait_for_completed_command(proxy: &mut PtyProxy, command_marker: &str) {
+        let description = format!(
+            "command end marker (OSC 133;D) and command text containing {command_marker:?}"
+        );
+        let mut saw_command_end = false;
+        poll_until(proxy, &description, |proxy, events| {
+            saw_command_end |= events
+                .iter()
+                .any(|event| matches!(event, OscEvent::CommandEnd { .. }));
+            saw_command_end
+                && proxy.blocks().completed_blocks().iter().any(|block| {
+                    block
+                        .command
+                        .as_deref()
+                        .map_or(false, |command| command.contains(command_marker))
+                })
+        });
+    }
+
     /// End-to-end: spawn bash under the proxy, drive a few commands, confirm
     /// the block engine picks them up with exit codes and command text.
     #[test]
@@ -296,35 +384,14 @@ mod tests {
             Err(_) => return,
         };
 
-        // Drain output in a loop until we see the first prompt marker,
-        // then send commands and drain again.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut buf = [0u8; 8192];
-        unsafe {
-            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
-            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        // Give bash a moment to print its first prompt
-        thread::sleep(Duration::from_millis(400));
-        let _ = proxy.read_output(&mut buf);
+        prepare_for_polling(&proxy);
+        wait_for_prompt(&mut proxy);
 
         proxy.write_input(b"echo hello-ptylenz\n").unwrap();
+        wait_for_completed_command(&mut proxy, "echo hello-ptylenz");
         proxy.write_input(b"false\n").unwrap();
+        wait_for_completed_command(&mut proxy, "false");
         proxy.write_input(b"exit\n").unwrap();
-
-        while Instant::now() < deadline {
-            match proxy.read_output(&mut buf) {
-                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
-                Ok(_) => {}
-                Err(_) => {}
-            }
-            if !proxy.child_alive() {
-                let _ = proxy.read_output(&mut buf);
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
 
         let blocks = proxy.blocks().completed_blocks();
         assert!(
@@ -350,15 +417,8 @@ mod tests {
             Err(_) => return,
         };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut buf = [0u8; 8192];
-        unsafe {
-            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
-            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        thread::sleep(Duration::from_millis(400));
-        let _ = proxy.read_output(&mut buf);
+        prepare_for_polling(&proxy);
+        wait_for_prompt(&mut proxy);
 
         // Start an alt-screen session, idle in it, then leave. The sleep
         // guarantees that the post-entry output arrives in a separate read
@@ -373,28 +433,14 @@ mod tests {
             )
             .unwrap();
 
-        // Drain across the sleep so feed_output() sees alt-screen bytes,
-        // pauses (no data), then later sees the exit-alt bytes.
-        let mid_deadline = Instant::now() + Duration::from_millis(900);
-        while Instant::now() < mid_deadline {
-            let _ = proxy.read_output(&mut buf);
-            thread::sleep(Duration::from_millis(50));
-        }
-
+        poll_until(&mut proxy, "alt-screen marker", |proxy, _| {
+            proxy
+                .blocks()
+                .current_alt_snapshot()
+                .map_or(false, |snapshot| snapshot.contains("TUI-MARKER-XYZZY"))
+        });
+        wait_for_completed_command(&mut proxy, "TUI-MARKER");
         proxy.write_input(b"exit\n").unwrap();
-
-        while Instant::now() < deadline {
-            match proxy.read_output(&mut buf) {
-                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
-                Ok(_) => {}
-                Err(_) => {}
-            }
-            if !proxy.child_alive() {
-                let _ = proxy.read_output(&mut buf);
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
 
         let blocks = proxy.blocks().completed_blocks();
         let alt_block = blocks.iter().find(|b| {
@@ -426,33 +472,14 @@ mod tests {
             Err(_) => return,
         };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut buf = [0u8; 8192];
-        unsafe {
-            let flags = libc::fcntl(proxy.master_fd(), libc::F_GETFL);
-            libc::fcntl(proxy.master_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-
-        thread::sleep(Duration::from_millis(400));
-        let _ = proxy.read_output(&mut buf);
+        prepare_for_polling(&proxy);
+        wait_for_prompt(&mut proxy);
 
         proxy
             .write_input(b"echo LINE-ONE; echo LINE-TWO; echo LINE-THREE\n")
             .unwrap();
+        wait_for_completed_command(&mut proxy, "LINE-ONE");
         proxy.write_input(b"exit\n").unwrap();
-
-        while Instant::now() < deadline {
-            match proxy.read_output(&mut buf) {
-                Ok((clean, _)) if clean.is_empty() && !proxy.child_alive() => break,
-                Ok(_) => {}
-                Err(_) => {}
-            }
-            if !proxy.child_alive() {
-                let _ = proxy.read_output(&mut buf);
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
 
         let blocks = proxy.blocks().completed_blocks();
         let echo_block = blocks
