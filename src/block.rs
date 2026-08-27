@@ -143,7 +143,10 @@ impl Block {
             None => "running...".to_string(),
         };
         let time = self.started_at.format("%H:%M:%S");
-        format!("#{} {} — {} — {} lines — {}", self.id, cmd, time, lines, status)
+        format!(
+            "#{} {} — {} — {} lines — {}",
+            self.id, cmd, time, lines, status
+        )
     }
 }
 
@@ -256,7 +259,10 @@ impl BlockEngine {
                 tool_uses,
                 timestamp: _,
             } => {
-                let counter = self.claude_turn_counters.entry(session_id.clone()).or_insert(0);
+                let counter = self
+                    .claude_turn_counters
+                    .entry(session_id.clone())
+                    .or_insert(0);
                 *counter += 1;
                 let turn_index = *counter;
 
@@ -266,8 +272,7 @@ impl BlockEngine {
                 let rendered = render_turn(&role, &text, &tool_uses);
                 let now = Local::now();
                 let output_bytes = rendered.into_bytes();
-                let newline_count =
-                    output_bytes.iter().filter(|&&b| b == b'\n').count();
+                let newline_count = output_bytes.iter().filter(|&&b| b == b'\n').count();
 
                 let mut block = Block {
                     id,
@@ -480,10 +485,10 @@ impl BlockEngine {
 
     /// Get a block by ID.
     pub fn get_block(&self, id: usize) -> Option<&Block> {
-        self.blocks.iter().find(|b| b.id == id)
-            .or_else(|| {
-                self.current.as_ref().filter(|b| b.id == id)
-            })
+        self.blocks
+            .iter()
+            .find(|b| b.id == id)
+            .or_else(|| self.current.as_ref().filter(|b| b.id == id))
     }
 
     /// Get the Nth block in chronological order (0-based).
@@ -539,10 +544,7 @@ impl BlockEngine {
     ///
     /// See `github.com/opaopa6969/claude-session-replay/docs/data-model.md`.
     pub fn export_json(&self) -> String {
-        let source = format!(
-            "ptylenz-{}.json",
-            Local::now().format("%Y%m%d-%H%M%S")
-        );
+        let source = format!("ptylenz-{}.json", Local::now().format("%Y%m%d-%H%M%S"));
 
         let mut messages = String::new();
         let mut first = true;
@@ -569,12 +571,7 @@ impl BlockEngine {
                     .ended_at
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_else(|| ts.clone());
-                messages.push_str(&format_message(
-                    "assistant",
-                    &out,
-                    &ts_end,
-                    block.exit_code,
-                ));
+                messages.push_str(&format_message("assistant", &out, &ts_end, block.exit_code));
             }
         }
 
@@ -636,8 +633,8 @@ struct OscParser {
 #[derive(Debug, Clone, PartialEq)]
 enum ParseState {
     Normal,
-    Escape,      // saw \e
-    OscBody,     // saw \e]; accumulating until \a or \e\\
+    Escape,  // saw \e
+    OscBody, // saw \e]; accumulating until \a or \e\\
     /// Just consumed an OSC 133 terminated by ESC; the next byte is expected
     /// to be `\` (completing the ST sequence) and should be swallowed so it
     /// doesn't reach the terminal as a stray char.
@@ -755,12 +752,7 @@ impl OscParser {
     /// is consumed) or re-emit the original bytes verbatim so the terminal
     /// still receives them. Bytes that accumulated _before_ this OSC are
     /// flushed first so the event lands in the right place in the stream.
-    fn finish_osc(
-        &mut self,
-        pending: &mut Vec<u8>,
-        out: &mut Vec<ParseChunk>,
-        terminator: u8,
-    ) {
+    fn finish_osc(&mut self, pending: &mut Vec<u8>, out: &mut Vec<ParseChunk>, terminator: u8) {
         let payload = std::mem::take(&mut self.buf);
         match self.decode_osc(&payload) {
             Some(event) => {
@@ -811,11 +803,11 @@ impl OscParser {
             Some(OscEvent::PromptStart)
         } else if rest.starts_with('C') {
             Some(OscEvent::CommandStart)
-        } else if rest.starts_with("D;") {
-            let code = rest[2..].parse::<i32>().unwrap_or(-1);
+        } else if let Some(exit_code) = rest.strip_prefix("D;") {
+            let code = exit_code.parse::<i32>().unwrap_or(-1);
             Some(OscEvent::CommandEnd { exit_code: code })
-        } else if rest.starts_with("E;") {
-            let cmd = rest[2..].to_string();
+        } else if let Some(command) = rest.strip_prefix("E;") {
+            let cmd = command.to_string();
             Some(OscEvent::CommandText(cmd))
         } else {
             None
@@ -828,7 +820,11 @@ impl OscParser {
 /// lines below the main text.
 fn render_turn(role: &str, text: &str, tool_uses: &[ToolUse]) -> String {
     let mut out = String::with_capacity(text.len() + 64);
-    let label = if role == "user" { "▶ user" } else { "▶ assistant" };
+    let label = if role == "user" {
+        "▶ user"
+    } else {
+        "▶ assistant"
+    };
     out.push_str(label);
     out.push('\n');
     if !text.is_empty() {
@@ -878,7 +874,7 @@ fn append_truncated(out: &mut String, s: &str, max_bytes: usize) {
 /// TUI's unused bottom area doesn't show as a wall of whitespace.
 fn normalize_vt_snapshot(s: &str) -> String {
     let mut lines: Vec<&str> = s.split('\n').map(|l| l.trim_end()).collect();
-    while lines.last().map_or(false, |l| l.is_empty()) {
+    while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
     lines.join("\n")
@@ -895,7 +891,7 @@ fn strip_ansi(s: &str) -> String {
             // Skip CSI sequence
             if chars.peek() == Some(&'[') {
                 chars.next(); // consume '['
-                // Skip until we hit a letter (the final byte of CSI)
+                              // Skip until we hit a letter (the final byte of CSI)
                 while let Some(&next) = chars.peek() {
                     chars.next();
                     if next.is_ascii_alphabetic() {
@@ -1006,7 +1002,8 @@ mod tests {
         let (clean, events) = parse_flat(&mut parser, input);
         assert!(events.is_empty(), "no OSC event expected from garbage");
         assert_eq!(
-            clean, input.as_ref(),
+            clean,
+            input.as_ref(),
             "aborted OSC must be re-emitted verbatim so no output is lost"
         );
     }
