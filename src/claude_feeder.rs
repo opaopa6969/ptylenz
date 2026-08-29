@@ -348,4 +348,65 @@ mod tests {
         assert!(decode_line("not json").is_none());
         assert!(decode_line("").is_none());
     }
+
+    /// `extract_text_and_tools` walks `message.content`, which Claude Code
+    /// emits in several shapes. None of these boundary cases were pinned:
+    ///
+    ///   - an array with only a `tool_use` (no `text` block) — text stays
+    ///     empty, the tool is captured,
+    ///   - an empty array — neither text nor tools,
+    ///   - multiple `text` blocks — they must be joined with `\n`,
+    ///   - `content: null` — the `None` arm must not panic.
+    ///
+    /// A regression in any branch silently drops tool uses the Detail view
+    /// renders, or blanks the user turn — so pin all four together.
+    #[test]
+    fn decode_content_array_boundary_cases() {
+        // Only a tool_use, no text block.
+        let only_tool = r#"{"type":"assistant","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{"path":"x"}}]}}"#;
+        match decode_line(only_tool).expect("must decode") {
+            ClaudeEvent::Turn {
+                text, tool_uses, ..
+            } => {
+                assert!(text.is_empty(), "no text block → empty text");
+                assert_eq!(tool_uses.len(), 1);
+                assert_eq!(tool_uses[0].name, "Read");
+            }
+            _ => panic!("expected Turn"),
+        }
+
+        // Empty content array.
+        let empty = r#"{"type":"user","sessionId":"s","message":{"role":"user","content":[]}}"#;
+        match decode_line(empty).expect("must decode") {
+            ClaudeEvent::Turn {
+                text, tool_uses, ..
+            } => {
+                assert!(text.is_empty());
+                assert!(tool_uses.is_empty());
+            }
+            _ => panic!("expected Turn"),
+        }
+
+        // Multiple text blocks → joined with a single '\n'.
+        let multi = r#"{"type":"user","sessionId":"s","message":{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#;
+        match decode_line(multi).expect("must decode") {
+            ClaudeEvent::Turn { text, .. } => assert_eq!(text, "first\nsecond"),
+            _ => panic!("expected Turn"),
+        }
+
+        // content: null — must not panic and must not produce a Turn with
+        // spurious text. `message.content` is `Option<Value>` with `#[serde(default)]`,
+        // so an explicit null lands in the `_ => {}` arm of the match.
+        let null_content =
+            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":null}}"#;
+        match decode_line(null_content).expect("must decode") {
+            ClaudeEvent::Turn {
+                text, tool_uses, ..
+            } => {
+                assert!(text.is_empty());
+                assert!(tool_uses.is_empty());
+            }
+            _ => panic!("expected Turn"),
+        }
+    }
 }
