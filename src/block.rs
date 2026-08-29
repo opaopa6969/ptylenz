@@ -881,31 +881,84 @@ fn normalize_vt_snapshot(s: &str) -> String {
 }
 
 /// Strip ANSI escape sequences from a string (for plain-text search/display).
+///
+/// Handles the sequences that survive into `Block::output` — i.e. what the
+/// `OscParser` *re-emits verbatim* because it only consumes OSC 133 block
+/// markers:
+///   * CSI (`ESC [ ... <0x40-0x7E>`) — colors, cursor moves, …
+///   * OSC (`ESC ] ... (BEL | ESC \)`) — title (0), hyperlink (8), clipboard
+///     (52), color query (10/11/12), … The OSC parser deliberately passes
+///     these through to the user's terminal, but they must not appear in the
+///     plain-text view / search / export.
+///   * A bare `ESC` not followed by a known introducer is dropped (matches
+///     the previous behavior so stray escapes in binary don't leak).
 fn strip_ansi(s: &str) -> String {
-    // Simple regex-free approach: skip \e[...m and similar CSI sequences
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip CSI sequence
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                              // Skip until we hit a letter (the final byte of CSI)
-                while let Some(&next) = chars.peek() {
-                    chars.next();
-                    if next.is_ascii_alphabetic() {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != 0x1b {
+            // Fast path: copy a run of non-escape bytes verbatim.
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0x1b {
+                i += 1;
+            }
+            out.push_str(&s[start..i]);
+            continue;
+        }
+        // ESC seen — classify by the next byte.
+        let Some(&next) = bytes.get(i + 1) else {
+            // Trailing lone ESC at end of input: drop it (previous behavior).
+            break;
+        };
+        match next {
+            b'[' => {
+                // CSI: consume until the final byte (0x40–0x7E).
+                i += 2;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&c) {
                         break;
                     }
                 }
             }
-            // Skip other escape sequences (\e] already handled by OscParser)
-        } else {
-            result.push(c);
+            b']' => {
+                // OSC: consume until BEL (0x07) or ST (ESC \).
+                i += 2;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if c == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if c == 0x1b {
+                        // Expect '\' for the ST terminator.
+                        if bytes.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                        } else {
+                            // Stray ESC inside an OSC body: the OSC parser
+                            // would have aborted and re-emitted the bytes, so a
+                            // well-formed input never reaches here. Be
+                            // defensive — consume just the ESC and let the
+                            // outer loop re-evaluate the following byte.
+                            i += 1;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                // Other escape (not CSI/OSC): drop the ESC and let the next
+                // byte be processed on its own — matches the historical
+                // "drop the ESC, keep the rest" fallback.
+                i += 1;
+            }
         }
     }
-
-    result
+    out
 }
 
 #[cfg(test)]
@@ -1033,7 +1086,7 @@ mod tests {
         // byte flushes everything accumulated so far.
         let mut parser = OscParser::new();
         let mut input = b"\x1b]52;c;".to_vec();
-        input.extend(std::iter::repeat(b'A').take(4096));
+        input.extend(std::iter::repeat_n(b'A', 4096));
         input.push(0x00); // control byte → abort
         input.extend_from_slice(b"visible");
         let (clean, events) = parse_flat(&mut parser, &input);
@@ -1151,6 +1204,123 @@ mod tests {
         let input = "\x1b[32mgreen\x1b[0m plain \x1b[1;31mred\x1b[0m";
         let stripped = strip_ansi(input);
         assert_eq!(stripped, "green plain red");
+    }
+
+    /// Regression for issue #17: OSC sequences that the `OscParser` re-emits
+    /// verbatim (OSC 0 title, OSC 8 hyperlink, OSC 52 clipboard, …) must be
+    /// stripped from the plain-text view, search index, and JSON export. Before
+    /// the fix `strip_ansi` only handled CSI; the `ESC` was dropped but
+    /// `]0;title\x07` (and everything between the introducer and terminator)
+    /// leaked straight through.
+    #[test]
+    fn strip_ansi_removes_osc_sequences() {
+        // OSC 0 title, BEL-terminated.
+        assert_eq!(strip_ansi("\x1b]0;mytitle\x07"), "");
+        // OSC 0 title followed by visible text — only the visible part remains.
+        assert_eq!(
+            strip_ansi("\x1b]0;mytitle\x07echo OSC-LEAK-TEST"),
+            "echo OSC-LEAK-TEST"
+        );
+        // OSC 8 hyperlink: the label ("click") is between two OSC 8 wrappers;
+        // both wrappers must be stripped and the label kept.
+        assert_eq!(
+            strip_ansi("\x1b]8;;https://example.com\x07click\x1b]8;;\x07"),
+            "click"
+        );
+        // OSC 11 color query terminated with ST (ESC \).
+        assert_eq!(strip_ansi("\x1b]11;?\x1b\\"), "");
+        // A CSI sequence mixed in with OSCs still strips correctly.
+        assert_eq!(strip_ansi("\x1b[1m\x1b]0;t\x07visible\x1b[0m"), "visible");
+        // Bare ESC at end of input is dropped (no leak, no panic).
+        assert_eq!(strip_ansi("plain\x1b"), "plain");
+    }
+
+    /// Regression for issue #17 at the `Block::output_text()` level: a block
+    /// fed with a title-setting OSC followed by visible output must expose
+    /// only the visible output through `output_text()`. This mirrors the
+    /// issue's reproduction (`printf '\e]0;mytitle\aecho OSC-LEAK-TEST\n'`).
+    #[test]
+    fn output_text_strips_re_emitted_osc() {
+        let mut engine = BlockEngine::new();
+        // Start a command so the bytes accumulate in a current block.
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b]0;mytitle\x07echo OSC-LEAK-TEST\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+        let block = engine
+            .completed_blocks()
+            .last()
+            .expect("one completed block");
+        assert_eq!(block.output_text(), "echo OSC-LEAK-TEST\n");
+    }
+
+    /// Regression for issue #18: while the Detail view is open on a given block,
+    /// a `ClaudeEvent::Turn` arriving on the side channel inserts a new
+    /// completed block, which shifts the `get_block_by_index` mapping. Keying
+    /// the Detail view's line buffer by `block_id` (via `get_block`) keeps the
+    /// target stable; keying by the list `selected` index (via
+    /// `get_block_by_index`) would silently retarget j/k/y at the newly
+    /// inserted block. This test pins the invariant the fix relies on:
+    /// `get_block(id)` is stable across `blocks` growth, while
+    /// `get_block_by_index(selected)` is not.
+    #[test]
+    fn detail_block_id_stays_stable_across_concurrent_ingest() {
+        let mut engine = BlockEngine::new();
+
+        // A running shell command — the current block — which the Detail view
+        // will be opened on (selected index = block_count - 1, the current).
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"\x1b]133;E;sleep 30\x07");
+        engine.feed_output(b"sleeping...\n");
+
+        // Snapshot the Detail target before any concurrent ingest happens.
+        let current = engine.current_block().expect("current block exists");
+        let detail_block_id = current.id;
+        let selected_index = engine.block_count().saturating_sub(1);
+
+        // Sanity: before ingest, both lookups resolve to the same block.
+        assert_eq!(
+            engine.get_block(detail_block_id).map(|b| b.id),
+            engine.get_block_by_index(selected_index).map(|b| b.id),
+        );
+
+        // A Claude turn completes on the side channel and is inserted as a
+        // new completed block *before* the still-running current block.
+        engine.ingest_claude_event(ClaudeEvent::SessionStarted {
+            session_id: "s1".into(),
+            path: std::path::PathBuf::from("/tmp/s1.jsonl"),
+        });
+        engine.ingest_claude_event(ClaudeEvent::Turn {
+            session_id: "s1".into(),
+            role: "user".into(),
+            text: "hello claude".into(),
+            tool_uses: vec![],
+            timestamp: None,
+        });
+
+        // After ingest: get_block(detail_block_id) still resolves to the
+        // original running block (the Detail view's target).
+        let still_current = engine
+            .get_block(detail_block_id)
+            .expect("block_id lookup is stable");
+        assert_eq!(still_current.id, detail_block_id);
+        assert_eq!(
+            still_current.command.as_deref(),
+            Some("sleep 30"),
+            "block_id still points at the running command, not the Claude turn"
+        );
+
+        // But get_block_by_index(selected_index) now resolves to a *different*
+        // block — the newly-inserted Claude turn — because completed blocks
+        // come first in the index ordering. This is the divergence the fix
+        // closes: the Detail view must key off block_id, not selected_index.
+        let retargeted = engine
+            .get_block_by_index(selected_index)
+            .expect("index still in range");
+        assert_ne!(
+            retargeted.id, detail_block_id,
+            "selected index now silently points at the ingested Claude turn"
+        );
+        assert!(retargeted.is_claude_turn());
     }
 
     #[test]
