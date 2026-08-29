@@ -371,7 +371,7 @@ mod tests {
                     block
                         .command
                         .as_deref()
-                        .map_or(false, |command| command.contains(command_marker))
+                        .is_some_and(|command| command.contains(command_marker))
                 })
         });
     }
@@ -403,7 +403,7 @@ mod tests {
         let any_echo = blocks.iter().any(|b| {
             b.command
                 .as_deref()
-                .map_or(false, |c| c.contains("echo hello-ptylenz"))
+                .is_some_and(|c| c.contains("echo hello-ptylenz"))
         });
         assert!(
             any_echo,
@@ -444,7 +444,7 @@ mod tests {
             proxy
                 .blocks()
                 .current_alt_snapshot()
-                .map_or(false, |snapshot| snapshot.contains("TUI-MARKER-XYZZY"))
+                .is_some_and(|snapshot| snapshot.contains("TUI-MARKER-XYZZY"))
         });
         wait_for_completed_command(&mut proxy, "TUI-MARKER");
         proxy.write_input(b"exit\n").unwrap();
@@ -453,7 +453,7 @@ mod tests {
         let alt_block = blocks.iter().find(|b| {
             b.command
                 .as_deref()
-                .map_or(false, |c| c.contains("TUI-MARKER"))
+                .is_some_and(|c| c.contains("TUI-MARKER"))
         });
         assert!(
             alt_block.is_some(),
@@ -462,7 +462,7 @@ mod tests {
         );
         let rendered = alt_block.unwrap().rendered_text.as_deref();
         assert!(
-            rendered.map_or(false, |s| s.contains("TUI-MARKER-XYZZY")),
+            rendered.is_some_and(|s| s.contains("TUI-MARKER-XYZZY")),
             "expected rendered_text to contain the alt-screen token; rendered={:?}",
             rendered
         );
@@ -489,11 +489,9 @@ mod tests {
         proxy.write_input(b"exit\n").unwrap();
 
         let blocks = proxy.blocks().completed_blocks();
-        let echo_block = blocks.iter().find(|b| {
-            b.command
-                .as_deref()
-                .map_or(false, |c| c.contains("LINE-ONE"))
-        });
+        let echo_block = blocks
+            .iter()
+            .find(|b| b.command.as_deref().is_some_and(|c| c.contains("LINE-ONE")));
         assert!(
             echo_block.is_some(),
             "expected a non-alt-screen block for the echo command; blocks={:?}",
