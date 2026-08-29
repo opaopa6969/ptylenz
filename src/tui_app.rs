@@ -208,6 +208,17 @@ impl App {
         // Alt-screen terminal — only exists while Ptylenz mode is active.
         let mut ptylenz_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
 
+        // Safety net for the error path: if `run` returns `Err(?)` while we
+        // are still in the alt screen, `ptylenz_term.take()` (the happy-path
+        // cleanup at the bottom of `run` and inside `leave_ptylenz`) is
+        // skipped. `alt_guard` tracks whether we entered the alt screen and
+        // its `Drop` unconditionally emits `LeaveAlternateScreen` + shows the
+        // cursor when it is still marked active — so `?` propagation can no
+        // longer strand the terminal in the alt screen. The happy paths
+        // call `alt_guard.leave()` to clear the flag after their own
+        // explicit cleanup, making the guard's `Drop` a no-op. Issue: ptylenz#19.
+        let mut alt_guard = AltScreenGuard::new(io::stdout());
+
         // Dirty flag for the overlay. The poller wakes every 80ms even when
         // nothing happened; redrawing on every wake used to stream a small
         // per-frame epilogue (SGR reset + cursor-hide) to the terminal ~12
@@ -281,7 +292,13 @@ impl App {
                     match read_stdin(stdin_fd, &mut sbuf) {
                         Ok(0) => return Ok(()),
                         Ok(n) => {
-                            handle_input(&sbuf[..n], &mut mode, &mut proxy, &mut ptylenz_term)?;
+                            handle_input(
+                                &sbuf[..n],
+                                &mut mode,
+                                &mut proxy,
+                                &mut ptylenz_term,
+                                &mut alt_guard,
+                            )?;
                             needs_redraw = true;
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -302,6 +319,8 @@ impl App {
             let _ = term.show_cursor();
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
         }
+        // Happy-path cleanup ran; tell the guard it doesn't need to fire.
+        let _ = alt_guard.leave();
 
         println!(
             "\r\n[ptylenz] Session ended. {} blocks captured.\r",
@@ -316,6 +335,7 @@ fn handle_input(
     mode: &mut Mode,
     proxy: &mut PtyProxy,
     ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    alt_guard: &mut AltScreenGuard<io::Stdout>,
 ) -> Result<()> {
     match mode {
         Mode::Normal => {
@@ -327,13 +347,13 @@ fn handle_input(
                         proxy.write_input(&pass)?;
                         pass.clear();
                     }
-                    enter_ptylenz(mode, ptylenz_term, proxy)?;
+                    enter_ptylenz(mode, ptylenz_term, alt_guard, proxy)?;
                     // Any keys that came in the same batch after Ctrl+]
                     // should be interpreted by the Ptylenz mode handler,
                     // not lost or sent to the shell.
                     let rest: Vec<u8> = iter.collect();
                     if !rest.is_empty() {
-                        handle_ptylenz_bytes(&rest, mode, proxy, ptylenz_term)?;
+                        handle_ptylenz_bytes(&rest, mode, proxy, ptylenz_term, alt_guard)?;
                     }
                     return Ok(());
                 }
@@ -344,7 +364,7 @@ fn handle_input(
             }
         }
         Mode::Ptylenz { .. } => {
-            handle_ptylenz_bytes(bytes, mode, proxy, ptylenz_term)?;
+            handle_ptylenz_bytes(bytes, mode, proxy, ptylenz_term, alt_guard)?;
         }
     }
     Ok(())
@@ -353,12 +373,14 @@ fn handle_input(
 fn enter_ptylenz(
     mode: &mut Mode,
     ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    alt_guard: &mut AltScreenGuard<io::Stdout>,
     proxy: &PtyProxy,
 ) -> Result<()> {
     let count = proxy.blocks().block_count();
     let selected = count.saturating_sub(1);
 
     execute!(io::stdout(), EnterAlternateScreen).context("enter alt screen")?;
+    alt_guard.enter();
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend).context("create terminal")?;
     term.hide_cursor().ok();
@@ -379,6 +401,7 @@ fn enter_ptylenz(
 fn leave_ptylenz(
     mode: &mut Mode,
     ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    alt_guard: &mut AltScreenGuard<io::Stdout>,
     proxy: &PtyProxy,
 ) -> Result<()> {
     if let Some(mut term) = ptylenz_term.take() {
@@ -402,11 +425,16 @@ fn leave_ptylenz(
             .write_all(&proxy.blocks().shadow_repaint_bytes())
             .context("repaint child frame")?;
         stdout.flush().context("flush child repaint")?;
+        // We did NOT leave the alt screen from our side (the child still owns
+        // it), so the guard's safety-net flag must stay set — if `run` later
+        // errors out, the guard still needs to restore the primary screen.
+        // Do nothing to `alt_guard` here.
     } else {
         // Line-oriented child (bash, claude, …): the terminal's own
         // alternate-screen save/restore reproduces the correct primary screen,
         // so a plain leave is all that's needed.
         execute!(io::stdout(), LeaveAlternateScreen).context("leave alt screen")?;
+        alt_guard.leave()?;
     }
 
     *mode = Mode::Normal;
@@ -418,12 +446,13 @@ fn handle_ptylenz_bytes(
     mode: &mut Mode,
     proxy: &mut PtyProxy,
     ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    alt_guard: &mut AltScreenGuard<io::Stdout>,
 ) -> Result<()> {
     let keys = decode_keys(bytes);
     for (code, ctrl) in keys {
         // Ctrl+] always leaves Ptylenz mode, regardless of sub-state.
         if ctrl && code == Key::Char(']') {
-            return leave_ptylenz(mode, ptylenz_term, proxy);
+            return leave_ptylenz(mode, ptylenz_term, alt_guard, proxy);
         }
 
         let Mode::Ptylenz {
@@ -464,7 +493,7 @@ fn handle_ptylenz_bytes(
 
         match code {
             Key::Char('q') | Key::Esc => {
-                return leave_ptylenz(mode, ptylenz_term, proxy);
+                return leave_ptylenz(mode, ptylenz_term, alt_guard, proxy);
             }
             Key::Char('j') | Key::Down => {
                 let max = proxy.blocks().block_count().saturating_sub(1);
@@ -1213,6 +1242,59 @@ impl Drop for TermiosGuard {
     }
 }
 
+/// RAII guard that restores the primary screen on `Drop` if we are still in
+/// the alternate screen when `run` propagates an error via `?`.
+///
+/// The guard does **not** own the ratatui `Terminal`; that stays in
+/// `ptylenz_term: Option<Terminal<_>>` so the existing happy-path cleanups
+/// (`leave_ptylenz` and the end-of-`run` block) work unchanged. The guard
+/// only tracks whether we entered the alt screen (`enter()` sets the flag,
+/// `leave()` clears it). On `Drop`, if the flag is still set, the guard
+/// unconditionally writes `show_cursor` (CSI ?25h) + `LeaveAlternateScreen`
+/// (CSI ?1049l) to its writer — the safety net for the error path where
+/// `?` short-circuits past the explicit cleanup. A double-leave is cosmetic;
+/// being stranded in the alt screen is not. Issue: ptylenz#19.
+struct AltScreenGuard<W: io::Write> {
+    writer: W,
+    in_alt: bool,
+}
+
+impl<W: io::Write> AltScreenGuard<W> {
+    fn new(writer: W) -> Self {
+        AltScreenGuard {
+            writer,
+            in_alt: false,
+        }
+    }
+
+    /// Mark that we have entered the alternate screen. Idempotent.
+    fn enter(&mut self) {
+        self.in_alt = true;
+    }
+
+    /// Mark that we have left the alternate screen via the happy path, so
+    /// the guard's `Drop` becomes a no-op. Idempotent.
+    fn leave(&mut self) -> io::Result<()> {
+        if self.in_alt {
+            self.in_alt = false;
+        }
+        Ok(())
+    }
+}
+
+impl<W: io::Write> Drop for AltScreenGuard<W> {
+    fn drop(&mut self) {
+        if self.in_alt {
+            // Safety net: the happy path didn't clear the flag, so `run` is
+            // unwinding through `?`. Restore the primary screen. Errors are
+            // swallowed — we're already on an error path and can't do better.
+            let _ = self.writer.write_all(b"\x1b[?25h"); // show_cursor
+            let _ = self.writer.write_all(b"\x1b[?1049l"); // LeaveAlternateScreen
+            let _ = self.writer.flush();
+        }
+    }
+}
+
 fn terminal_size() -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     unsafe {
@@ -1359,5 +1441,86 @@ mod tests {
             selection_range_for_row(&d.selection, &d, 2, 20),
             (Some(2), Some(8))
         );
+    }
+
+    // --- AltScreenGuard (issue ptylenz#19) ---
+    //
+    // The guard's `Drop` is the safety net for error paths where `?`
+    // short-circuits past the explicit `LeaveAlternateScreen` cleanup. These
+    // tests pin the contract:
+    //   - after `enter()`, dropping the guard writes `show_cursor` (CSI ?25h)
+    //     and `LeaveAlternateScreen` (CSI ?1049l) to its writer;
+    //   - after `leave()`, dropping the guard writes nothing;
+    //   - a brand-new guard is not in alt mode and writes nothing on drop.
+    // The guard is generic over `W: io::Write`, so we test against a spy
+    // writer that records writes into a shared `Rc<RefCell<Vec<u8>>>`.
+
+    /// Spy writer that appends every byte to a shared buffer.
+    struct SpyWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl Clone for SpyWriter {
+        fn clone(&self) -> Self {
+            SpyWriter(self.0.clone())
+        }
+    }
+    impl io::Write for SpyWriter {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn spy() -> (SpyWriter, std::rc::Rc<std::cell::RefCell<Vec<u8>>>) {
+        let sink = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        (SpyWriter(sink.clone()), sink)
+    }
+
+    #[test]
+    fn alt_screen_guard_drop_emits_leave_after_enter() {
+        // Error path: `run` returns `Err(?)` while Ptylenz mode is active.
+        // The guard was `enter()`-ed but never `leave()`-d, so its `Drop`
+        // must restore the primary screen on its own.
+        let (spy_writer, sink) = spy();
+        let mut guard = AltScreenGuard::new(spy_writer);
+        guard.enter();
+        assert!(guard.in_alt);
+        drop(guard);
+        let bytes = sink.borrow();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(
+            s.contains("\x1b[?25h"),
+            "show_cursor (CSI ?25h) missing; got: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "LeaveAlternateScreen (CSI ?1049l) missing; got: {s:?}"
+        );
+    }
+
+    #[test]
+    fn alt_screen_guard_drop_is_noop_after_leave() {
+        // Happy path: `leave_ptylenz` (or the end-of-`run` cleanup) called
+        // `leave()`, clearing the flag. The guard's `Drop` must write nothing.
+        let (spy_writer, sink) = spy();
+        let mut guard = AltScreenGuard::new(spy_writer);
+        guard.enter();
+        guard.leave().unwrap();
+        assert!(!guard.in_alt);
+        drop(guard);
+        let bytes = sink.borrow();
+        assert!(
+            bytes.is_empty(),
+            "guard wrote after leave(); got: {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn alt_screen_guard_new_is_not_in_alt() {
+        let mut guard: AltScreenGuard<Vec<u8>> = AltScreenGuard::new(Vec::new());
+        assert!(!guard.in_alt);
+        guard.enter();
+        assert!(guard.in_alt);
     }
 }
