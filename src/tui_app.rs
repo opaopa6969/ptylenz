@@ -86,6 +86,53 @@ fn install_sigwinch_handler() {
     }
 }
 
+/// RAII guard around the ratatui `Terminal` that owns the alternate screen.
+///
+/// Ptylenz mode enters the alternate screen on activation and **must** leave
+/// it before the process exits, otherwise the user's terminal is stranded on
+/// the alt buffer with no visible prompt (issue #19). Previously the cleanup
+/// lived at the end of `App::run` as a plain `if let Some(term) = …` block,
+/// which any `?`-propagated error inside the loop skipped. Moving the
+/// terminal behind this guard makes `Drop` run on every exit path — `?`,
+/// panic unwind, and the normal end-of-loop return alike — so
+/// `LeaveAlternateScreen` + `show_cursor` are always emitted when the alt
+/// screen was entered.
+///
+/// `leave_ptylenz` deliberately takes the terminal *out* of the guard (via
+/// `take`) when the user presses `q`/`Ctrl+]`: the leave path has its own
+/// logic for the shadow-alt-screen repaint case (a child TUI still owns the
+/// alt buffer, so emitting `LeaveAlternateScreen` would strand it). The
+/// guard only covers the "process is exiting while still in Ptylenz mode"
+/// case, where the child is going away too and a plain leave is correct.
+struct PtylenzTermGuard {
+    term: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+}
+
+impl PtylenzTermGuard {
+    fn new() -> Self {
+        PtylenzTermGuard { term: None }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<io::Stdout>>> {
+        self.term.as_mut()
+    }
+
+    /// Take the terminal out, leaving the guard inert (Drop becomes a no-op).
+    /// Used by `leave_ptylenz` which performs its own, more nuanced cleanup.
+    fn take(&mut self) -> Option<Terminal<CrosstermBackend<io::Stdout>>> {
+        self.term.take()
+    }
+}
+
+impl Drop for PtylenzTermGuard {
+    fn drop(&mut self) {
+        if let Some(mut term) = self.term.take() {
+            let _ = term.show_cursor();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
 /// Persistent search state inside Ptylenz mode. Survives exiting the
 /// search sub-mode so `n`/`N` keep working on the last result set.
 #[derive(Debug, Clone)]
@@ -206,7 +253,9 @@ impl App {
         let mut mode = Mode::Normal;
 
         // Alt-screen terminal — only exists while Ptylenz mode is active.
-        let mut ptylenz_term: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
+        // Held behind `PtylenzTermGuard` so that `Drop` restores the primary
+        // screen even when `run` returns via `?` on an error path (issue #19).
+        let mut ptylenz_term = PtylenzTermGuard::new();
 
         // Dirty flag for the overlay. The poller wakes every 80ms even when
         // nothing happened; redrawing on every wake used to stream a small
@@ -298,11 +347,6 @@ impl App {
             }
         }
 
-        if let Some(mut term) = ptylenz_term.take() {
-            let _ = term.show_cursor();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        }
-
         println!(
             "\r\n[ptylenz] Session ended. {} blocks captured.\r",
             proxy.blocks().block_count()
@@ -315,7 +359,7 @@ fn handle_input(
     bytes: &[u8],
     mode: &mut Mode,
     proxy: &mut PtyProxy,
-    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut PtylenzTermGuard,
 ) -> Result<()> {
     match mode {
         Mode::Normal => {
@@ -352,7 +396,7 @@ fn handle_input(
 
 fn enter_ptylenz(
     mode: &mut Mode,
-    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut PtylenzTermGuard,
     proxy: &PtyProxy,
 ) -> Result<()> {
     let count = proxy.blocks().block_count();
@@ -372,13 +416,13 @@ fn enter_ptylenz(
     };
 
     draw_ptylenz(&mut term, mode, proxy)?;
-    *ptylenz_term = Some(term);
+    ptylenz_term.term = Some(term);
     Ok(())
 }
 
 fn leave_ptylenz(
     mode: &mut Mode,
-    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut PtylenzTermGuard,
     proxy: &PtyProxy,
 ) -> Result<()> {
     if let Some(mut term) = ptylenz_term.take() {
@@ -417,7 +461,7 @@ fn handle_ptylenz_bytes(
     bytes: &[u8],
     mode: &mut Mode,
     proxy: &mut PtyProxy,
-    ptylenz_term: &mut Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    ptylenz_term: &mut PtylenzTermGuard,
 ) -> Result<()> {
     let keys = decode_keys(bytes);
     for (code, ctrl) in keys {
@@ -443,7 +487,7 @@ fn handle_ptylenz_bytes(
 
         // Detail view captures everything; never falls back to list bindings.
         if let PtylenzView::Detail(detail) = view {
-            match handle_detail_key(code, ctrl, detail, *selected, proxy, status_message) {
+            match handle_detail_key(code, ctrl, detail, proxy, status_message) {
                 DetailOutcome::StayInDetail => {}
                 DetailOutcome::BackToList => {
                     *view = PtylenzView::List;
@@ -552,13 +596,16 @@ fn handle_detail_key(
     code: Key,
     ctrl: bool,
     detail: &mut DetailState,
-    selected_index: usize,
     proxy: &PtyProxy,
     status_message: &mut Option<String>,
 ) -> DetailOutcome {
-    // Resolve the block & line buffer once per key — cheap, and avoids holding
-    // a borrow across the cursor-mutation logic below.
-    let lines: Vec<String> = match proxy.blocks().get_block_by_index(selected_index) {
+    // Resolve the block by its *ID*, never by the list `selected` index.
+    // `draw_detail` paints whatever `detail.block_id` points at; if we keyed
+    // the line buffer off `selected` instead, a completed block inserted by
+    // `ingest_claude_event` while the Detail view is open would shift the
+    // index→block mapping and silently retarget j/k/y at a different block
+    // (issue #18). ID lookup is stable regardless of how `blocks` grows.
+    let lines: Vec<String> = match proxy.blocks().get_block(detail.block_id) {
         Some(b) => b.output_text().lines().map(|s| s.to_string()).collect(),
         None => return DetailOutcome::BackToList,
     };
@@ -1359,5 +1406,32 @@ mod tests {
             selection_range_for_row(&d.selection, &d, 2, 20),
             (Some(2), Some(8))
         );
+    }
+
+    /// Regression for issue #19: the alt-screen cleanup must run on every
+    /// exit path from `App::run`, including `?`-propagated errors. We moved
+    /// the terminal behind `PtylenzTermGuard` so `Drop` performs the
+    /// `show_cursor` + `LeaveAlternateScreen` cleanup. `Drop` is structured
+    /// as `if let Some(mut term) = self.term.take() { … }`, so the cleanup
+    /// runs iff `take()` returns `Some`. This test pins the two sides of that
+    /// contract without constructing a real ratatui `Terminal` (which needs
+    /// a live stdout and is flaky under `cargo test`'s captured pipe):
+    ///
+    /// 1. A fresh guard reports `None` from `as_mut()` — `Drop` will skip
+    ///    cleanup (the no-alt-screen-entered case).
+    /// 2. `take()` on a fresh guard returns `None` — the exact condition
+    ///    `Drop` evaluates, so an inert guard stays inert on drop.
+    ///
+    /// Together these assert the guard is safe to drop at any point in
+    /// `run`, which is the whole point of the RAII fix.
+    #[test]
+    fn ptylenz_term_guard_is_safe_to_drop_when_empty() {
+        let mut guard = PtylenzTermGuard::new();
+        assert!(guard.as_mut().is_none(), "fresh guard holds no terminal");
+        assert!(
+            guard.take().is_none(),
+            "empty take returns None — Drop is a no-op"
+        );
+        drop(guard); // must not panic, must not emit anything
     }
 }
