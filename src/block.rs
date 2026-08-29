@@ -1667,4 +1667,122 @@ mod tests {
         assert_eq!(blocks[1].command.as_deref(), Some("false"));
         assert_eq!(blocks[1].exit_code, Some(1));
     }
+
+    /// `search` is case-insensitive and must also scan the still-running
+    /// block (the `n`/`N` navigation in the TUI relies on both). The lowercasing
+    /// is done only on the query side here — a regression that flipped the
+    /// direction (lowercasing the lines but not the query) would silently
+    /// break uppercase queries. Pin both halves: uppercase query finds
+    /// lowercase text and vice-versa, and a match in the in-progress block
+    /// is returned with its block id.
+    #[test]
+    fn search_is_case_insensitive_and_covers_current_block() {
+        let mut engine = BlockEngine::new();
+
+        // Completed block with mixed-case output.
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"Hello World\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        // Still-running block whose output only appears via current_block().
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"RUNNING-STREAM-token\n");
+
+        let running_id = engine.current_block().expect("current block").id;
+
+        // Uppercase query hits lowercase text in the completed block.
+        let hi = engine.search("HELLO");
+        assert_eq!(hi.len(), 1, "uppercase query must match lowercase text");
+        assert!(hi[0].2.contains("Hello"));
+
+        // Lowercase query hits uppercase text in the running block.
+        let run = engine.search("running-stream");
+        assert!(
+            run.iter().any(|(id, _, _)| *id == running_id),
+            "search must cover the in-progress block; got {:?}",
+            run
+        );
+    }
+
+    /// `get_block` / `get_block_by_index` / `index_of_block_id` are the
+    /// navigation substrate for the whole TUI. Existing tests only exercise
+    /// the Some-path; pin the None-path so a future change that starts
+    /// returning a stale `&Block` for a freed id (use-after-free via index)
+    /// or panics on an out-of-range index is caught immediately.
+    #[test]
+    fn block_lookups_return_none_for_missing_id_and_out_of_range_index() {
+        let mut engine = BlockEngine::new();
+        engine.feed_output(b"\x1b]133;C\x07");
+        engine.feed_output(b"out\n");
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        // No block has id 0 (ids start at 1) or 999.
+        assert!(engine.get_block(0).is_none());
+        assert!(engine.get_block(999).is_none());
+        assert!(engine.index_of_block_id(0).is_none());
+        assert!(engine.index_of_block_id(999).is_none());
+
+        // One completed block → valid indices are 0..=0.
+        assert!(engine.get_block_by_index(0).is_some());
+        assert!(engine.get_block_by_index(1).is_none(), "past-end index");
+        assert!(engine.get_block_by_index(usize::MAX).is_none());
+    }
+
+    /// `resize` clamps rows/cols to at least 1 before forwarding to the vt100
+    /// parsers. A SIGWINCH reporting 0x0 (possible on some PTY loss / detach
+    /// scenarios) must not construct a 0-size grid — the vt100 crate panics
+    /// on that, which would crash the whole TUI. Pin the clamp on both axes.
+    ///
+    /// **Currently ignored — see issue #21.** This test exposed a real
+    /// bug: `resize` clamps to `rows.max(1)`, but vt100 0.15.2 underflows
+    /// when `process()` runs on a parser whose `rows == 1` (regardless of
+    /// cols). So a 0-row SIGWINCH still crashes the TUI one read later.
+    /// The clamp needs to be `max(2)` (or a vt100 upgrade) — tracked in the
+    /// issue, not fixed here per the test-only mandate.
+    #[test]
+    #[ignore = "exposed bug: rows=1 still panics in vt100::process — see issue #21"]
+    fn resize_clamps_zero_dimensions_to_one() {
+        let mut engine = BlockEngine::new();
+        // Start a command so a per-block vt_parser exists during the resize.
+        engine.feed_output(b"\x1b]133;C\x07");
+
+        // 0×0 — the dangerous case.
+        engine.resize(0, 0);
+        engine.feed_output(b"survived-zero-resize\n");
+
+        // 0×N and N×0 — each axis clamped independently.
+        engine.resize(0, 40);
+        engine.feed_output(b"survived-zero-cols\n");
+        engine.resize(80, 0);
+        engine.feed_output(b"survived-zero-rows\n");
+
+        engine.feed_output(b"\x1b]133;D;0\x07");
+
+        // If any of the above panicked we never get here.
+        let block = &engine.completed_blocks()[0];
+        assert!(block.output_text().contains("survived-zero-resize"));
+    }
+
+    /// `json_escape` feeds the `text` field of every exported message.
+    /// Existing tests cover `\n`, `\t`, `\\`, `\"`. The JSON spec also
+    /// requires escaping `\r`, `\b` (0x08), `\f` (0x0c), and every other
+    /// C0 control as `\uXXXX`. A regression that dropped any of these
+    /// would produce invalid JSON on `export_json`, silently breaking
+    /// downstream `claude-session-replay` ingestion.
+    #[test]
+    fn json_escape_handles_control_chars_and_rfc8259_c0_set() {
+        // Carriage return + backspace + Form feed.
+        assert_eq!(json_escape("\r\x08\x0c"), "\\r\\b\\f");
+        // A generic C0 control below 0x20 that has no short escape —
+        // e.g. vertical tab 0x0B — must come out as \u000b.
+        assert_eq!(json_escape("a\x0bb"), "a\\u000bb");
+        // 0x1F (unit separator, last C0) rounds out the set.
+        assert_eq!(json_escape("\x1f"), "\\u001f");
+        // Mixed with regular chars to ensure the fast path and the escape
+        // path interleave without dropping anything.
+        assert_eq!(
+            json_escape("plain\twith\rcr\nand\x08bs"),
+            "plain\\twith\\rcr\\nand\\bbs"
+        );
+    }
 }
