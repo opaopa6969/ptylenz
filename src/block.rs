@@ -219,7 +219,10 @@ impl BlockEngine {
     /// Update the terminal size used when starting new blocks and propagate
     /// to any in-flight vt100 parser.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.term_rows = rows.max(1);
+        // vt100 0.15.2 can underflow while processing wrapped text on a
+        // one-row grid. Keep the shadow parsers at least two rows tall even
+        // when the PTY reports a zero-sized terminal during detach/cleanup.
+        self.term_rows = rows.max(2);
         self.term_cols = cols.max(1);
         if let Some(parser) = self.vt_parser.as_mut() {
             parser.set_size(self.term_rows, self.term_cols);
@@ -1728,20 +1731,12 @@ mod tests {
         assert!(engine.get_block_by_index(usize::MAX).is_none());
     }
 
-    /// `resize` clamps rows/cols to at least 1 before forwarding to the vt100
-    /// parsers. A SIGWINCH reporting 0x0 (possible on some PTY loss / detach
-    /// scenarios) must not construct a 0-size grid — the vt100 crate panics
-    /// on that, which would crash the whole TUI. Pin the clamp on both axes.
-    ///
-    /// **Currently ignored — see issue #21.** This test exposed a real
-    /// bug: `resize` clamps to `rows.max(1)`, but vt100 0.15.2 underflows
-    /// when `process()` runs on a parser whose `rows == 1` (regardless of
-    /// cols). So a 0-row SIGWINCH still crashes the TUI one read later.
-    /// The clamp needs to be `max(2)` (or a vt100 upgrade) — tracked in the
-    /// issue, not fixed here per the test-only mandate.
+    /// `resize` clamps rows to at least 2 and cols to at least 1 before
+    /// forwarding to the vt100 parsers. A SIGWINCH reporting 0x0 (possible on
+    /// some PTY loss / detach scenarios) must not construct a grid that makes
+    /// the vt100 crate panic while processing output.
     #[test]
-    #[ignore = "exposed bug: rows=1 still panics in vt100::process — see issue #21"]
-    fn resize_clamps_zero_dimensions_to_one() {
+    fn resize_clamps_zero_dimensions_to_safe_sizes() {
         let mut engine = BlockEngine::new();
         // Start a command so a per-block vt_parser exists during the resize.
         engine.feed_output(b"\x1b]133;C\x07");
