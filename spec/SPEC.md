@@ -185,7 +185,7 @@ block-beta
 | 制限 | 詳細 |
 |------|------|
 | bash のみ自動統合 | zsh, fish は手動スニペット (§8 参照) |
-| CLI オプションなし | `--shell`, `--no-integrate` は未実装 |
+| CLI は最小構成 | `--shell`, `--no-integrate`, `--help`, `--version` を提供。`--export` は未実装 |
 | ブロック上限なし | 長時間セッションで数百 MB になりうる |
 | CJK 全角ずれ | ratatui の幅計算と unicode-width の不一致 (§10.4) |
 | Windows 非対応 | §1.4 参照 |
@@ -878,15 +878,15 @@ fn append_truncated(out: &mut String, s: &str, max_bytes: usize) {
 
 ### 6.1 CLI インターフェース
 
-**v0.1 の実装**:
+**2026-09-05 時点の実装**:
 
 ```
-$ ptylenz
+$ ptylenz [OPTIONS]
 ```
 
-引数なし。`$SHELL` 環境変数の値を shell パスとして使用する。`$SHELL` が未設定の場合は `/bin/bash` にフォールバックする。
+引数なしでは `ptylenz` は `$SHELL` 環境変数の値を shell パスとして使用する。`$SHELL` が未設定の場合は `/bin/bash` にフォールバックする。
 
-**計画中のオプション** (Phase 3 以降):
+**サポート済みオプション**:
 
 ```
 ptylenz [OPTIONS]
@@ -895,10 +895,14 @@ ptylenz [OPTIONS]
   --shell <PATH>      起動するシェルのパス (デフォルト: $SHELL)
   --no-integrate      shell integration を注入しない
                       (外部で OSC 133 を設定済みのシェル向け)
-  --export <FILE>     ptylenz を起動せず JSON エクスポートして終了
-                      (既存セッション JSON の再エクスポートに使用)
   --version           バージョン文字列を表示して終了
   -h, --help          ヘルプを表示して終了
+```
+
+**未実装のまま残すオプション**:
+
+```text
+--export <FILE>
 ```
 
 ### 6.2 公開 Rust API

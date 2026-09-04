@@ -45,6 +45,12 @@ case "$PS1" in
 esac
 "#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnOptions<'a> {
+    pub shell_path: &'a str,
+    pub shell_integration: bool,
+}
+
 /// The PTY proxy: owns the master side of a PTY pair and
 /// the child shell process.
 pub struct PtyProxy {
@@ -58,7 +64,8 @@ pub struct PtyProxy {
 
 impl PtyProxy {
     /// Spawn a child shell inside a new PTY, with shell integration.
-    pub fn spawn(shell_path: &str) -> Result<Self> {
+    pub fn spawn(options: SpawnOptions<'_>) -> Result<Self> {
+        let shell_path = options.shell_path;
         // Detect whether the requested shell is bash so we can pass bash-specific
         // flags.  Only the final path component is checked so that paths like
         // /usr/local/bin/bash, /opt/homebrew/bin/bash, etc. all match.
@@ -71,7 +78,7 @@ impl PtyProxy {
         // Using --rcfile with a wrapper preserves the user's bash environment while
         // letting us inject the OSC 133 markers we need for block detection.
         // Only done for bash; other shells don't support --rcfile.
-        let rcfile = if is_bash {
+        let rcfile = if is_bash && options.shell_integration {
             Some(write_bash_rcfile()?)
         } else {
             None
@@ -380,7 +387,10 @@ mod tests {
     /// the block engine picks them up with exit codes and command text.
     #[test]
     fn spawn_bash_and_detect_blocks() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -419,7 +429,10 @@ mod tests {
     /// TUI apps.
     #[test]
     fn alt_screen_command_produces_rendered_text() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -474,7 +487,10 @@ mod tests {
     /// mirroring / line_count caching.
     #[test]
     fn plain_command_captures_visible_output() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -519,6 +535,63 @@ mod tests {
         assert_eq!(
             b.cached_line_count, actual_newlines,
             "cached_line_count drifted from actual newline count"
+        );
+    }
+
+    #[test]
+    fn spawn_bash_without_integration_preserves_passthrough_without_blocks() {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: false,
+        }) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        prepare_for_polling(&proxy);
+        proxy
+            .write_input(b"printf 'NO-INTEGRATION-OK\\n'; exit\n")
+            .unwrap();
+
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let mut buf = [0u8; 8192];
+        let mut clean_output = Vec::new();
+        let mut observed_events = Vec::new();
+
+        while Instant::now() < deadline {
+            match proxy.read_output(&mut buf) {
+                Ok((clean, events)) => {
+                    clean_output.extend_from_slice(&clean);
+                    observed_events.extend(events.iter().map(|event| format!("{event:?}")));
+                }
+                Err(error) => {
+                    let msg = format!("{error:#}");
+                    if !msg.contains("EAGAIN") && !msg.contains("Resource temporarily unavailable")
+                    {
+                        panic!("unexpected PTY read error: {msg}");
+                    }
+                }
+            }
+
+            if !proxy.child_alive() {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let text = String::from_utf8_lossy(&clean_output);
+        assert!(
+            text.contains("NO-INTEGRATION-OK"),
+            "expected passthrough output without integration; output={text:?}"
+        );
+        assert!(
+            observed_events.is_empty(),
+            "unexpected OSC events when integration is disabled: {observed_events:?}"
+        );
+        assert_eq!(
+            proxy.blocks().block_count(),
+            0,
+            "no synthetic shell blocks should be captured without integration"
         );
     }
 }
