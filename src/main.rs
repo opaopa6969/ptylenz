@@ -11,11 +11,11 @@ use std::process;
 use cli::Command;
 
 fn main() -> Result<()> {
-    let command = match cli::parse_args(env::args()) {
+    let command = match cli::collect_args(env::args_os()).and_then(cli::parse_args) {
         Ok(command) => command,
         Err(error) => {
             eprintln!("ptylenz: {error}\n");
-            eprintln!("{}", cli::help_text());
+            eprint!("{}", cli::help_text());
             process::exit(2);
         }
     };

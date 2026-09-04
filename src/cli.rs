@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 
 const DEFAULT_SHELL: &str = "/bin/bash";
@@ -37,6 +38,38 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// Turn the OS-level argv into `String`s without panicking.
+///
+/// `env::args()` panics on any argument that is not valid UTF-8, which on Unix
+/// is a legal (if unusual) shell path. A bad argument is a usage error, so it
+/// has to reach the same "print message, exit non-zero" path as every other
+/// one instead of aborting with a backtrace.
+pub fn collect_args<I>(args: I) -> Result<Vec<String>, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    args.into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|bad| {
+                CliError::new(format!(
+                    "argument is not valid UTF-8: {}",
+                    bad.to_string_lossy()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Resolve the shell to launch when `--shell` is absent.
+///
+/// An empty `$SHELL` is treated like an unset one: it is not a launchable path,
+/// and the documented fallback is `/bin/bash`.
+fn default_shell(env_shell: Option<String>) -> String {
+    env_shell
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SHELL.to_string())
+}
+
 pub fn parse_args<I>(args: I) -> Result<Command, CliError>
 where
     I: IntoIterator<Item = String>,
@@ -44,7 +77,7 @@ where
     let mut iter = args.into_iter();
     let _program = iter.next();
 
-    let mut shell_path = env::var("SHELL").unwrap_or_else(|_| DEFAULT_SHELL.to_string());
+    let mut shell_path = default_shell(env::var("SHELL").ok());
     let mut shell_integration = true;
 
     while let Some(arg) = iter.next() {
@@ -152,6 +185,44 @@ mod tests {
     fn parse_rejects_unknown_option() {
         let error = parse_args(argv(&["ptylenz", "--bogus"])).expect_err("must fail");
         assert_eq!(error.to_string(), "unknown option: --bogus");
+    }
+
+    #[test]
+    fn default_shell_falls_back_for_unset_and_empty_env() {
+        assert_eq!(default_shell(None), DEFAULT_SHELL);
+        assert_eq!(default_shell(Some(String::new())), DEFAULT_SHELL);
+        assert_eq!(default_shell(Some("/bin/zsh".to_string())), "/bin/zsh");
+    }
+
+    #[test]
+    fn collect_args_rejects_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            OsString::from("ptylenz"),
+            OsString::from("--shell"),
+            OsString::from_vec(vec![0xff, 0xfe]),
+        ];
+        let error = collect_args(args).expect_err("must fail");
+        assert!(
+            error
+                .to_string()
+                .starts_with("argument is not valid UTF-8:"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn collect_args_keeps_valid_utf8_including_multibyte() {
+        let args = vec![
+            OsString::from("ptylenz"),
+            OsString::from("--shell"),
+            OsString::from("/tmp/シェル"),
+        ];
+        assert_eq!(
+            collect_args(args).expect("parse succeeds"),
+            vec!["ptylenz", "--shell", "/tmp/シェル"]
+        );
     }
 
     #[test]
