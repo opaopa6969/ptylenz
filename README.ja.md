@@ -72,6 +72,17 @@ ptylenz
 
 bash が ptylenz の中で起動する。挙動は今までと一切変わらない — ただし出力を振り返りたくなった瞬間、それは構造化されている。
 
+起動時オプション:
+
+```bash
+ptylenz --help
+ptylenz --version
+ptylenz --shell /bin/bash
+ptylenz --no-integrate
+```
+
+`--shell` はこの 1 回だけ `$SHELL` を上書きする。`--no-integrate` は、外部で OSC 133 を設定済みの bash 環境向けにラッパー rcfile 注入を無効化する。
+
 ## 二つのモード、一つのプレフィックスキー
 
 UI は単一のルールに従う: **Normal モードでは ptylenz は不可視**。すべてのキーストローク（一つを除いて）はそのまま bash へ、すべての出力バイトはそのまま画面へ。ptylenz は何もしない。例外は `Ctrl+]` — これだけが Ptylenz モードへの境界。

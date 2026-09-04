@@ -6,11 +6,11 @@
 //! All bytes flowing in both directions pass through ptylenz,
 //! allowing us to detect block boundaries (via OSC markers)
 //! and index the output.
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{self, ForkResult, Pid};
+use nix::unistd::{self, access, AccessFlags, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -45,6 +45,12 @@ case "$PS1" in
 esac
 "#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnOptions<'a> {
+    pub shell_path: &'a str,
+    pub shell_integration: bool,
+}
+
 /// The PTY proxy: owns the master side of a PTY pair and
 /// the child shell process.
 pub struct PtyProxy {
@@ -58,7 +64,16 @@ pub struct PtyProxy {
 
 impl PtyProxy {
     /// Spawn a child shell inside a new PTY, with shell integration.
-    pub fn spawn(shell_path: &str) -> Result<Self> {
+    pub fn spawn(options: SpawnOptions<'_>) -> Result<Self> {
+        let shell_path = options.shell_path;
+
+        // Fail before the fork: `execvp` can only report failure from the child,
+        // where the sole signal back to the parent is a PTY that closes at once.
+        // The user then sees either "Session ended. 0 blocks captured." with exit
+        // status 0 or a raw EIO from the master fd, depending on which side of
+        // the race wins.  A bad `--shell` deserves one clear message instead.
+        validate_shell_path(shell_path)?;
+
         // Detect whether the requested shell is bash so we can pass bash-specific
         // flags.  Only the final path component is checked so that paths like
         // /usr/local/bin/bash, /opt/homebrew/bin/bash, etc. all match.
@@ -71,7 +86,7 @@ impl PtyProxy {
         // Using --rcfile with a wrapper preserves the user's bash environment while
         // letting us inject the OSC 133 markers we need for block detection.
         // Only done for bash; other shells don't support --rcfile.
-        let rcfile = if is_bash {
+        let rcfile = if is_bash && options.shell_integration {
             Some(write_bash_rcfile()?)
         } else {
             None
@@ -238,6 +253,43 @@ impl Drop for PtyProxy {
     }
 }
 
+/// Default search path used only when `$PATH` is unset, mirroring the list
+/// `execvp` falls back to in that case.
+const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Check that the requested shell can actually be executed.
+///
+/// Bare names (no `/`) are resolved through `$PATH` the same way `execvp` does,
+/// so `--shell bash` keeps working while `--shell bsah` fails with a message.
+fn validate_shell_path(shell_path: &str) -> Result<()> {
+    if shell_path.is_empty() {
+        bail!("shell path must not be empty");
+    }
+
+    if shell_path.contains('/') {
+        return check_executable(std::path::Path::new(shell_path));
+    }
+
+    let search_path = std::env::var_os("PATH").unwrap_or_else(|| FALLBACK_PATH.into());
+    for dir in std::env::split_paths(&search_path) {
+        if check_executable(&dir.join(shell_path)).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("shell not found in $PATH: {shell_path}")
+}
+
+fn check_executable(path: &std::path::Path) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot launch shell {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("shell is not a regular file: {}", path.display());
+    }
+    access(path, AccessFlags::X_OK)
+        .with_context(|| format!("shell is not executable: {}", path.display()))?;
+    Ok(())
+}
+
 /// Read the current terminal's winsize from STDOUT so the PTY can be opened
 /// at the correct dimensions before fork. Returns None if STDOUT isn't a tty
 /// or the ioctl fails — caller falls back to openpty's kernel default.
@@ -380,7 +432,10 @@ mod tests {
     /// the block engine picks them up with exit codes and command text.
     #[test]
     fn spawn_bash_and_detect_blocks() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -419,7 +474,10 @@ mod tests {
     /// TUI apps.
     #[test]
     fn alt_screen_command_produces_rendered_text() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -474,7 +532,10 @@ mod tests {
     /// mirroring / line_count caching.
     #[test]
     fn plain_command_captures_visible_output() {
-        let mut proxy = match PtyProxy::spawn("/bin/bash") {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: true,
+        }) {
             Ok(p) => p,
             Err(_) => return,
         };
@@ -519,6 +580,136 @@ mod tests {
         assert_eq!(
             b.cached_line_count, actual_newlines,
             "cached_line_count drifted from actual newline count"
+        );
+    }
+
+    #[test]
+    fn validate_shell_path_rejects_unusable_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let empty = validate_shell_path("").expect_err("empty path must fail");
+        assert!(
+            empty.to_string().contains("must not be empty"),
+            "unexpected message: {empty}"
+        );
+
+        let missing =
+            validate_shell_path("/nonexistent/ptylenz-shell").expect_err("missing path must fail");
+        assert!(
+            format!("{missing:#}").contains("/nonexistent/ptylenz-shell"),
+            "message should name the offending path: {missing:#}"
+        );
+
+        // A directory passes access(X_OK) — it is "searchable" — so the regular
+        // file check has to catch it separately.
+        let directory = validate_shell_path("/tmp").expect_err("directory must fail");
+        assert!(
+            directory.to_string().contains("not a regular file"),
+            "unexpected message: {directory}"
+        );
+
+        let not_executable = NamedTempFile::new().expect("create temp file");
+        std::fs::set_permissions(
+            not_executable.path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod temp file");
+        let error = validate_shell_path(
+            not_executable
+                .path()
+                .to_str()
+                .expect("temp path is valid UTF-8"),
+        )
+        .expect_err("non-executable file must fail");
+        assert!(
+            error.to_string().contains("not executable"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_shell_path_resolves_bare_names_through_path() {
+        validate_shell_path("sh").expect("sh must resolve through $PATH");
+
+        let error = validate_shell_path("ptylenz-not-a-real-shell")
+            .expect_err("unresolvable bare name must fail");
+        assert!(
+            error.to_string().contains("not found in $PATH"),
+            "unexpected message: {error}"
+        );
+    }
+
+    /// A typo in `--shell` must fail deterministically at spawn time rather than
+    /// racing the child's exec failure through the PTY.
+    #[test]
+    fn spawn_rejects_unusable_shell_before_forking() {
+        let error = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/nonexistent/ptylenz-shell",
+            shell_integration: true,
+        }) {
+            Ok(_) => panic!("spawn must fail for a nonexistent shell"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("/nonexistent/ptylenz-shell"),
+            "message should name the offending path: {error:#}"
+        );
+    }
+
+    #[test]
+    fn spawn_bash_without_integration_preserves_passthrough_without_blocks() {
+        let mut proxy = match PtyProxy::spawn(SpawnOptions {
+            shell_path: "/bin/bash",
+            shell_integration: false,
+        }) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        prepare_for_polling(&proxy);
+        proxy
+            .write_input(b"printf 'NO-INTEGRATION-OK\\n'; exit\n")
+            .unwrap();
+
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let mut buf = [0u8; 8192];
+        let mut clean_output = Vec::new();
+        let mut observed_events = Vec::new();
+
+        while Instant::now() < deadline {
+            match proxy.read_output(&mut buf) {
+                Ok((clean, events)) => {
+                    clean_output.extend_from_slice(&clean);
+                    observed_events.extend(events.iter().map(|event| format!("{event:?}")));
+                }
+                Err(error) => {
+                    let msg = format!("{error:#}");
+                    if !msg.contains("EAGAIN") && !msg.contains("Resource temporarily unavailable")
+                    {
+                        panic!("unexpected PTY read error: {msg}");
+                    }
+                }
+            }
+
+            if !proxy.child_alive() {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+
+        let text = String::from_utf8_lossy(&clean_output);
+        assert!(
+            text.contains("NO-INTEGRATION-OK"),
+            "expected passthrough output without integration; output={text:?}"
+        );
+        assert!(
+            observed_events.is_empty(),
+            "unexpected OSC events when integration is disabled: {observed_events:?}"
+        );
+        assert_eq!(
+            proxy.blocks().block_count(),
+            0,
+            "no synthetic shell blocks should be captured without integration"
         );
     }
 }

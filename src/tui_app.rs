@@ -56,7 +56,8 @@ use std::time::Duration;
 
 use crate::block::{Block, BlockSource};
 use crate::claude_feeder;
-use crate::pty::PtyProxy;
+use crate::cli::RunConfig;
+use crate::pty::{PtyProxy, SpawnOptions};
 
 const STDIN_KEY: usize = 0;
 const PTY_KEY: usize = 1;
@@ -199,17 +200,22 @@ enum Mode {
 
 pub struct App {
     shell_path: String,
+    shell_integration: bool,
 }
 
 impl App {
-    pub fn new(shell_path: &str) -> Result<Self> {
+    pub fn new(config: RunConfig) -> Result<Self> {
         Ok(App {
-            shell_path: shell_path.to_string(),
+            shell_path: config.shell_path,
+            shell_integration: config.shell_integration,
         })
     }
 
     pub fn run(self) -> Result<()> {
-        let mut proxy = PtyProxy::spawn(&self.shell_path)?;
+        let mut proxy = PtyProxy::spawn(SpawnOptions {
+            shell_path: &self.shell_path,
+            shell_integration: self.shell_integration,
+        })?;
 
         if let Some((cols, rows)) = terminal_size() {
             proxy.resize(cols, rows).ok();

@@ -45,12 +45,11 @@ sudo mv ptylenz /usr/local/bin/
 Verify it landed on your `PATH`:
 
 ```bash
-command -v ptylenz
+ptylenz --version
 ```
 
-(ptylenz does not yet parse flags like `--version`; running `ptylenz` with no
-arguments drops you straight into the PTY session. `command -v` is the
-non-interactive way to confirm the install.)
+You can also use `command -v ptylenz` if you only want to confirm `PATH`
+resolution without executing the binary.
 
 ---
 
@@ -98,6 +97,14 @@ Now press **`Ctrl+]`** to enter Ptylenz mode.
 You should see a block list overlaid on the screen. Each command you ran is a block showing its timestamp, line count, exit status, and command text.
 
 Navigate with `j`/`k` (or arrow keys). Press `Enter` to expand/collapse a block. Press `q` or `Esc` or `Ctrl+]` again to return to Normal mode.
+
+Useful launch-time overrides:
+
+```bash
+ptylenz --help
+ptylenz --shell /bin/bash
+ptylenz --no-integrate
+```
 
 ---
 
@@ -214,7 +221,7 @@ Your shell path may not be bash. ptylenz reads `$SHELL` to pick the shell to spa
 Workaround until per-shell integration is complete:
 
 ```bash
-SHELL=/bin/bash ptylenz
+ptylenz --shell /bin/bash
 ```
 
 ### The block list is empty after running commands

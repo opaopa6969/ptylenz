@@ -45,12 +45,10 @@ sudo mv ptylenz /usr/local/bin/
 `PATH` に通ったか確認:
 
 ```bash
-command -v ptylenz
+ptylenz --version
 ```
 
-(ptylenz はまだ `--version` のようなフラグを解釈しない。引数なしで `ptylenz` を
-実行するとそのまま PTY セッションに入る。非対話で導入を確認するなら
-`command -v` を使う。)
+単に `PATH` 解決だけ確認したいなら `command -v ptylenz` でもよい。
 
 ---
 
@@ -98,6 +96,14 @@ cargo test 2>&1 | head -20
 ブロックリストが画面にオーバーレイされるはず。実行した各コマンドがタイムスタンプ・行数・終了ステータス・コマンドテキストとともにブロックとして表示される。
 
 `j`/`k` (または矢印キー) でナビゲート。`Enter` でブロックを展開/折り畳み。`q`・`Esc`・または再度 `Ctrl+]` で Normal モードに戻る。
+
+便利な起動時 override:
+
+```bash
+ptylenz --help
+ptylenz --shell /bin/bash
+ptylenz --no-integrate
+```
 
 ---
 
@@ -214,7 +220,7 @@ cargo uninstall ptylenz
 各シェルの統合が完成するまでの回避策:
 
 ```bash
-SHELL=/bin/bash ptylenz
+ptylenz --shell /bin/bash
 ```
 
 ### コマンドを実行してもブロックリストが空のまま

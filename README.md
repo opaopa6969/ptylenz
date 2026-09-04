@@ -72,6 +72,17 @@ ptylenz
 
 Your bash starts inside ptylenz. Everything works exactly as before — except the moment you want to look back at output, it's structured.
 
+Runtime options:
+
+```bash
+ptylenz --help
+ptylenz --version
+ptylenz --shell /bin/bash
+ptylenz --no-integrate
+```
+
+`--shell` overrides `$SHELL` for one launch. `--no-integrate` skips bash OSC 133 rcfile injection when your shell already emits those markers externally.
+
 ## Two modes, one prefix
 
 The whole UI follows a single rule: **Normal mode is invisible**. Every keystroke (except one) flows straight to bash, every byte of output flows straight to your screen. ptylenz is doing nothing visible. The one exception is `Ctrl+]` — that switches into Ptylenz mode, where ratatui takes over the screen.
