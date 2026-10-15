@@ -16,7 +16,7 @@ concurrency:
 jobs:
   quality:
     name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, ptylenz-ci]
     steps:
       - uses: actions/checkout@v7
 
